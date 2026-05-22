@@ -9,9 +9,12 @@
 """
 
 import json
+import logging
 import re
 import sys
 from openai import OpenAI
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -117,7 +120,7 @@ def execute_tool(tool_name, params):
     执行工具 —— 框架预留，当前工具列表为空
     扩展时在此处添加工具名到具体实现的路由逻辑
     """
-    print(f"[WARN] 未找到工具实现：{tool_name}")
+    logger.warning("未找到工具实现:%s", tool_name)
     return json.dumps({"error": f"工具 {tool_name} 暂未实现"}, ensure_ascii=False)
 
 
@@ -171,24 +174,24 @@ def react(api_key, memory, latest_input):
     """ReAct 核心循环：Thought -> Action -> Observation，直到不再需要工具调用"""
     while True:
         prompt = build_prompt(USER_PROMPT, TOOLS, memory, latest_input)
-        print(f"[INFO] prompt=\n{prompt}\n")
+        logger.info("prompt=\n%s", prompt)
 
         llm_result = llm(prompt, api_key)
-        print(f"[INFO] llmResult=\n{llm_result}\n")
+        logger.info("llmResult=\n%s", llm_result)
 
         # 尝试匹配工具调用
         matched_tool_name = match_tool_action(llm_result)
 
         if matched_tool_name is not None:
-            print(f"[INFO] 执行工具调用：{matched_tool_name}，开始")
+            logger.info("执行工具调用:%s,开始", matched_tool_name)
 
             # 解析 Action Input 中的 JSON 参数
             action_input = parse_action_input(llm_result)
-            print(f"[INFO] 工具参数：{action_input}")
+            logger.info("工具参数:%s", action_input)
 
             # 执行工具
             tool_result = execute_tool(matched_tool_name, action_input)
-            print(f"[INFO] 执行工具调用：{matched_tool_name}，结果={tool_result}")
+            logger.info("执行工具调用:%s,结果=%s", matched_tool_name, tool_result)
 
             # 将 LLM 输出和工具结果作为 Observation 追加，进入下一轮循环
             latest_input += f"\n{llm_result}\nObservation: {tool_result}"
@@ -202,6 +205,11 @@ def react(api_key, memory, latest_input):
 # ============================================================
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    )
+
     if len(sys.argv) != 2:
         print("ak未配置，结束!")
         print("用法: python common_chat_agent.py <your_api_key>")
