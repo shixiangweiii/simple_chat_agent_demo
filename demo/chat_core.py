@@ -51,6 +51,66 @@ TOOL_RESULT_PREVIEW_CHARS = 500
 
 
 # ============================================================
+# HITL (Human-in-the-Loop) 基础设施
+# ============================================================
+# 仅在 API_MODE=chat 路径生效:模型调用 LOCAL_TOOLS 中的工具时,业务层暂停 ReAct,
+# 把恢复点存进 _PENDING[session_id],SSE 流以 await_user + done 关闭;
+# 前端拿到用户操作后 POST /api/resume,新启一条 SSE 流接续 _stream_react_rounds。
+
+_PENDING: dict[str, dict] = {}
+
+# 本地伪工具(不走 MCP)。schema 直接喂给 OpenAI tools 字段,模型按 native function calling 调用。
+LOCAL_TOOLS: dict[str, dict] = {
+    "ask_user": {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": (
+                "当你信息不足、需要用户澄清时调用。前端会展示输入框等用户答复,"
+                "答复作为本工具结果回传给你。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "向用户提的问题"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选,推荐选项列表,前端会渲染成快捷按钮",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    "execute_shell_command": {
+        "type": "function",
+        "function": {
+            "name": "execute_shell_command",
+            "description": (
+                "执行 shell 命令(危险操作,需用户审批)。**前端会展示同意/拒绝按钮**,"
+                "用户同意才会执行,拒绝时你会收到拒绝原因。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "完整 shell 命令"},
+                    "reason": {"type": "string", "description": "为何要执行,展示给用户做决策"},
+                },
+                "required": ["command", "reason"],
+            },
+        },
+    },
+}
+
+# 每个 LOCAL_TOOL 的前端交互类型:input(等用户输入回答) | approval(等同意/拒绝)
+_LOCAL_TOOL_KIND: dict[str, str] = {
+    "ask_user": "input",
+    "execute_shell_command": "approval",
+}
+
+
+# ============================================================
 # Prompt 模板
 # ============================================================
 
@@ -60,8 +120,10 @@ USER_PROMPT = """# 角色设定
 ## 能力
 1. 理解用户的自然语言输入，进行多轮对话；
 2. **内置联网搜索**：系统已为你接入联网搜索能力。当用户询问天气、新闻、股价、近期事件等需要实时信息的问题，或你不确定的事实性问题时，请获取最新信息并基于搜索结果作答；**不要**输出 Thought/Action 文本，也不要回复"无法获取实时数据"；
-3. 当下方"工具列表"中有自定义工具时，按 Thought/Action/Observation 协议调用；
-4. 既不需要联网也不需要自定义工具时，直接给出清晰、有帮助的回复。
+3. **澄清提问**：当用户问题关键信息不足（语言/版本/范围/偏好等）时，调用 `ask_user` 工具向用户索取具体信息，可在 `options` 中给出推荐选项，**不要凭空假设**；
+4. **危险操作审批**：涉及执行命令、删除数据、修改系统等敏感动作时，调用 `execute_shell_command` 工具发起审批，**不要**直接回复"我无法执行"或自行假设结果；
+5. 当下方"工具列表"中有自定义工具时，按 Thought/Action/Observation 协议调用；
+6. 既不需要联网也不需要自定义工具时，直接给出清晰、有帮助的回复。
 
 ## 行为准则
 - 回复简洁明了，避免冗余；
@@ -152,6 +214,15 @@ class InvalidSessionId(ValueError):
 
 class HistoryNotFound(LookupError):
     """指定 session_id 没有归档文件。HTTP 层应翻译为 404。"""
+
+
+class PendingNotFound(LookupError):
+    """session 当前无 pending HITL(可能已被新 chat 清掉,或本来就没有)。HTTP 层应翻译为 404。"""
+
+
+class PendingMismatch(ValueError):
+    """resume 提交的 tool_call_id 与 pending awaiting.tool_call_id 不匹配,
+    通常意味着前端拿了过期的 HITL bubble 提交。HTTP 层应翻译为 409。"""
 
 
 def _archive_path(session_id: str) -> Path:
@@ -393,19 +464,25 @@ def _memory_to_messages(memory: Memory, system_prompt: str, user_input: str) -> 
     return messages
 
 
-def _get_native_tools() -> list[dict]:
-    """同步:首次调用走 mcp_web_search 的 schema 发现并缓存。CLI ReAct 循环用。"""
+def _build_native_tools() -> list[dict]:
+    """同步:首次调用走 mcp_web_search 的 schema 发现 + 合并 LOCAL_TOOLS 并缓存。CLI ReAct 循环用。
+
+    LOCAL_TOOLS 在 CLI 模式下也对模型可见 —— 由 _react_chat_native 在执行时短路,
+    避免 CLI/Web 两条路径的 tools 列表语义分裂。
+    """
     global _NATIVE_TOOLS_CACHE
     if _NATIVE_TOOLS_CACHE is None:
-        _NATIVE_TOOLS_CACHE = mcp_web_search.discover_tool_spec()
+        mcp_tools = mcp_web_search.discover_tool_spec()
+        _NATIVE_TOOLS_CACHE = [*mcp_tools, *LOCAL_TOOLS.values()]
     return _NATIVE_TOOLS_CACHE
 
 
-async def _get_native_tools_async() -> list[dict]:
-    """异步:首次调用走 mcp_web_search 的 schema 发现并缓存。Web ReAct 循环用。"""
+async def _build_native_tools_async() -> list[dict]:
+    """异步:首次调用走 mcp_web_search 的 schema 发现 + 合并 LOCAL_TOOLS 并缓存。Web ReAct 循环用。"""
     global _NATIVE_TOOLS_CACHE
     if _NATIVE_TOOLS_CACHE is None:
-        _NATIVE_TOOLS_CACHE = await mcp_web_search.discover_tool_spec_async()
+        mcp_tools = await mcp_web_search.discover_tool_spec_async()
+        _NATIVE_TOOLS_CACHE = [*mcp_tools, *LOCAL_TOOLS.values()]
     return _NATIVE_TOOLS_CACHE
 
 
@@ -424,7 +501,7 @@ def _react_chat_native(memory: Memory, user_input: str) -> str:
     """
     messages = _memory_to_messages(memory, USER_PROMPT, user_input)
     try:
-        tools = _get_native_tools()
+        tools = _build_native_tools()
     except Exception as exc:
         logger.exception("MCP schema 发现失败")
         return f"MCP schema 发现失败: {exc}"
@@ -468,7 +545,14 @@ def _react_chat_native(memory: Memory, user_input: str) -> str:
                 args = {}
             logger.info("执行工具调用:%s,开始", tc["name"])
             logger.info("工具参数:%s", args)
-            tool_result = mcp_web_search.call_tool_sync(tc["name"], args)
+            if tc["name"] in LOCAL_TOOLS:
+                # HITL 工具在 CLI 模式下无法交互,直接喂回错误字符串让模型换路
+                tool_result = (
+                    f"[HITL 工具 {tc['name']} 在 CLI 模式下不可用，"
+                    "请直接以文本方式向用户说明或寻求其他途径]"
+                )
+            else:
+                tool_result = mcp_web_search.call_tool_sync(tc["name"], args)
             logger.info("执行工具调用:%s,结果=%s", tc["name"], tool_result)
             messages.append({
                 "role": "tool",
@@ -480,89 +564,101 @@ def _react_chat_native(memory: Memory, user_input: str) -> str:
     return f"（已达到最大 ReAct 轮次 {MAX_ROUNDS}，对话中断，请重试或换个问法）"
 
 
-async def _stream_chat_native(
+async def _stream_react_rounds(
+    session_id: str,
     memory: Memory,
     user_input: str,
+    messages: list[dict],
+    tools: list[dict],
+    start_round: int,
+    pending_remaining: list[dict],
     is_disconnected: Callable[[], Awaitable[bool]],
 ) -> AsyncGenerator[tuple[str, dict], None]:
-    """[chat 模式 + native function calling] 异步流式 ReAct 循环,Web 用。
+    """ReAct 流式循环主体,支持两种入口:
+       - fresh start: start_round=0, pending_remaining=[]
+       - resume:      start_round=断点轮次, pending_remaining=断点未消费的剩余 tool_calls
 
-    yield 的 (event_name, payload) 元组**完全复用**现有 SSE 契约:
-        status / thinking / chunk / tool_call / tool_result / done / error
-    前端 index.html 已就绪,无需改动。
+    HITL 触发时把恢复点写入 _PENDING[session_id],yield ("await_user", ...) + ("done", {}) 关流。
     """
-    messages = _memory_to_messages(memory, USER_PROMPT, user_input)
-    try:
-        tools = await _get_native_tools_async()
-    except Exception as exc:
-        logger.exception("MCP schema 发现失败")
-        yield ("error", {"message": f"MCP schema 发现失败: {exc}"})
-        return
+    for round_num in range(start_round, MAX_ROUNDS):
+        # ============ 1) 取本轮 tool_calls ============
+        # resume 第一轮:直接复用断点处尚未消费的剩余队列,**跳过** LLM 调用
+        if pending_remaining:
+            accumulated_tool_calls = pending_remaining
+            pending_remaining = []
+            accumulated_content = ""
+            accumulated_reasoning = ""
+            logger.info(
+                "ReAct 第 %d 轮(resume 接续):跳过 LLM 调用,直接派发剩余 tool_calls=%d 个",
+                round_num, len(accumulated_tool_calls),
+            )
+        else:
+            yield ("status", {"phase": "thinking", "round": round_num})
+            logger.info(
+                "ReAct 第 %d 轮开始(chat+native):msg_count=%d tools=%s",
+                round_num, len(messages), [t["function"]["name"] for t in tools],
+            )
 
-    for round_num in range(MAX_ROUNDS):
-        yield ("status", {"phase": "thinking", "round": round_num})
-        logger.info(
-            "ReAct 第 %d 轮开始(chat+native):msg_count=%d tools=%s",
-            round_num, len(messages), [t["function"]["name"] for t in tools],
-        )
+            accumulated_content = ""
+            accumulated_reasoning = ""
+            accumulated_tool_calls = []
+            answering_flipped = False
 
-        accumulated_content = ""
-        accumulated_reasoning = ""
-        accumulated_tool_calls: list[dict] = []
-        answering_flipped = False
+            try:
+                async for kind, payload in llm_stream_chat_with_tools(messages, tools):
+                    if await is_disconnected():
+                        return
+                    if kind == "thinking":
+                        accumulated_reasoning += payload
+                        yield ("thinking", {"text": payload})
+                        continue
+                    if kind == "tool_calls":
+                        accumulated_tool_calls = payload
+                        continue
+                    if kind == "error":
+                        yield ("error", {"message": payload})
+                        return
+                    # kind == "content"
+                    if not answering_flipped:
+                        answering_flipped = True
+                        yield ("status", {"phase": "answering", "round": round_num})
+                    accumulated_content += payload
+                    yield ("chunk", {"text": payload})
+            except Exception as exc:
+                logger.exception("LLM 调用失败(chat+native)")
+                yield ("error", {"message": f"LLM 调用失败: {exc}"})
+                return
 
-        try:
-            async for kind, payload in llm_stream_chat_with_tools(messages, tools):
-                if await is_disconnected():
-                    return
-                if kind == "thinking":
-                    accumulated_reasoning += payload
-                    yield ("thinking", {"text": payload})
-                    continue
-                if kind == "tool_calls":
-                    accumulated_tool_calls = payload
-                    continue
-                if kind == "error":
-                    yield ("error", {"message": payload})
-                    return
-                # kind == "content"
-                if not answering_flipped:
-                    answering_flipped = True
-                    yield ("status", {"phase": "answering", "round": round_num})
-                accumulated_content += payload
-                yield ("chunk", {"text": payload})
-        except Exception as exc:
-            logger.exception("LLM 调用失败(chat+native)")
-            yield ("error", {"message": f"LLM 调用失败: {exc}"})
-            return
+            logger.info(
+                "第 %d 轮 llmResult(content=%d 字, tool_calls=%d 个, reasoning=%d 字)",
+                round_num, len(accumulated_content), len(accumulated_tool_calls),
+                len(accumulated_reasoning),
+            )
 
-        logger.info(
-            "第 %d 轮 llmResult(content=%d 字, tool_calls=%d 个, reasoning=%d 字)",
-            round_num, len(accumulated_content), len(accumulated_tool_calls),
-            len(accumulated_reasoning),
-        )
+            if not accumulated_tool_calls:
+                # 收尾:把本 turn 的 final assistant content 写回 Memory
+                memory.add(Memory.USER, user_input)
+                memory.add(Memory.AI, accumulated_content)
+                yield ("done", {})
+                return
 
-        if not accumulated_tool_calls:
-            memory.add(Memory.USER, user_input)
-            memory.add(Memory.AI, accumulated_content)
-            yield ("done", {})
-            return
+            # reasoning_content 在 thinking 模式下必须跨轮保留(参考 docs:142),不需要时透传也无害
+            assistant_msg: dict = {
+                "role": "assistant",
+                "content": accumulated_content or None,
+                "tool_calls": [
+                    {"id": tc["id"], "type": "function",
+                     "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                    for tc in accumulated_tool_calls
+                ],
+            }
+            if accumulated_reasoning:
+                assistant_msg["reasoning_content"] = accumulated_reasoning
+            messages.append(assistant_msg)
 
-        # reasoning_content 在 thinking 模式下必须跨轮保留(参考 docs:142),不需要时透传也无害。
-        assistant_msg: dict = {
-            "role": "assistant",
-            "content": accumulated_content or None,
-            "tool_calls": [
-                {"id": tc["id"], "type": "function",
-                 "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                for tc in accumulated_tool_calls
-            ],
-        }
-        if accumulated_reasoning:
-            assistant_msg["reasoning_content"] = accumulated_reasoning
-        messages.append(assistant_msg)
-
-        for tc in accumulated_tool_calls:
+        # ============ 2) tool 派发:按 name 分发到 LOCAL_TOOLS(HITL) 或 MCP ============
+        while accumulated_tool_calls:
+            tc = accumulated_tool_calls.pop(0)
             if await is_disconnected():
                 return
             try:
@@ -573,6 +669,36 @@ async def _stream_chat_native(
             logger.info("执行工具调用:%s,开始", tc["name"])
             logger.info("工具参数:%s", args)
             yield ("tool_call", {"name": tc["name"], "args": args})
+
+            if tc["name"] in LOCAL_TOOLS:
+                # HITL 中断点:存恢复点,yield await_user + done,等 /api/resume 启新流接续
+                _PENDING[session_id] = {
+                    "user_input": user_input,
+                    "messages": messages,
+                    "tools": tools,
+                    "round_num": round_num,
+                    "remaining_tool_calls": accumulated_tool_calls,
+                    "awaiting": {
+                        "tool_call_id": tc["id"],
+                        "name": tc["name"],
+                        "args": args,
+                        "kind": _LOCAL_TOOL_KIND[tc["name"]],
+                    },
+                }
+                logger.info(
+                    "HITL 中断:session=%s tool=%s tool_call_id=%s remaining=%d 个",
+                    session_id, tc["name"], tc["id"], len(accumulated_tool_calls),
+                )
+                yield ("await_user", {
+                    "tool_call_id": tc["id"],
+                    "name": tc["name"],
+                    "args": args,
+                    "kind": _LOCAL_TOOL_KIND[tc["name"]],
+                })
+                yield ("done", {})
+                return
+
+            # 非 HITL:MCP 工具,正常执行
             tool_result = await mcp_web_search.call_tool_async(tc["name"], args)
             logger.info("执行工具调用:%s,结果=%s", tc["name"], tool_result)
             yield ("tool_result", {"name": tc["name"], "result": _truncate_tool_result(tool_result)})
@@ -583,6 +709,118 @@ async def _stream_chat_native(
             })
 
     yield ("error", {"message": "超过最大 ReAct 轮次，已中断"})
+
+
+async def _stream_chat_native(
+    memory: Memory,
+    user_input: str,
+    is_disconnected: Callable[[], Awaitable[bool]],
+    session_id: str,
+) -> AsyncGenerator[tuple[str, dict], None]:
+    """[chat 模式 + native function calling] 异步流式 ReAct 循环,Web 用。
+
+    yield 的 (event_name, payload) 元组**完全复用**现有 SSE 契约,新增 await_user 一项:
+        status / thinking / chunk / tool_call / tool_result / await_user / done / error
+    """
+    # 新一轮 chat:清掉旧 pending,防止僵尸 _PENDING 项常驻
+    _PENDING.pop(session_id, None)
+
+    messages = _memory_to_messages(memory, USER_PROMPT, user_input)
+    try:
+        tools = await _build_native_tools_async()
+    except Exception as exc:
+        logger.exception("MCP schema 发现失败")
+        yield ("error", {"message": f"MCP schema 发现失败: {exc}"})
+        return
+
+    async for event in _stream_react_rounds(
+        session_id, memory, user_input, messages, tools, 0, [], is_disconnected,
+    ):
+        yield event
+
+
+# ============================================================
+# HITL resume —— /api/resume 入口
+# ============================================================
+
+def resume_chat_response(
+    session_id: str,
+    tool_call_id: str,
+    decision: str,
+    answer: str | None,
+    is_disconnected: Callable[[], Awaitable[bool]],
+) -> AsyncGenerator[tuple[str, dict], None]:
+    """HITL resume 入口:**同步外壳**做参数校验 + 弹出 _PENDING(可抛异常被 HTTP 翻译),
+    返回内层 _resume_inner 异步生成器供 StreamingResponse 消费。
+
+    必须 split 是因为 async generator 的 body 只有在第一次 __anext__ 时才执行,
+    若直接写 async def + yield,异常将延迟到流开始后才抛出,HTTP 层无法翻译。
+
+    decision 取值:
+        - "answer"  (ask_user)  : answer=用户答复文本
+        - "approve" (execute_shell_command): 同意执行(本 demo 用 stub 字符串)
+        - "reject"  (execute_shell_command): 拒绝,answer=可选拒绝理由
+    """
+    if not SESSION_ID_RE.match(session_id):
+        raise InvalidSessionId(session_id)
+    state = _PENDING.pop(session_id, None)
+    if state is None:
+        raise PendingNotFound(session_id)
+    if state["awaiting"]["tool_call_id"] != tool_call_id:
+        # 不匹配:把 pending 还回去,让用户能用正确 id 重试(否则 pending 就丢了)
+        _PENDING[session_id] = state
+        raise PendingMismatch(tool_call_id)
+    return _resume_inner(session_id, state, decision, answer, is_disconnected)
+
+
+async def _resume_inner(
+    session_id: str,
+    state: dict,
+    decision: str,
+    answer: str | None,
+    is_disconnected: Callable[[], Awaitable[bool]],
+) -> AsyncGenerator[tuple[str, dict], None]:
+    """resume 的真正流式体:构造 tool result → append role=tool → 继续 _stream_react_rounds。"""
+    memory = get_or_load(session_id)
+    awaiting = state["awaiting"]
+    name = awaiting["name"]
+
+    # 构造 tool result(模型看到的字符串)
+    if name == "ask_user":
+        tool_result = answer or "(用户未提供答复)"
+    elif name == "execute_shell_command":
+        if decision == "approve":
+            # demo 不真执行 shell —— 教学焦点是 HITL 流程,不引入真实 RCE 风险
+            cmd = awaiting["args"].get("command", "")
+            tool_result = (
+                f"[demo stub] 已模拟执行命令: {cmd}\n"
+                "(本 demo 不会真正执行 shell,仅演示 HITL 审批流程)"
+            )
+        else:  # reject
+            tool_result = f"用户拒绝执行。理由: {answer or '(未填写)'}"
+    else:
+        tool_result = "(未知 HITL 工具)"
+
+    logger.info(
+        "HITL resume:session=%s tool=%s decision=%s tool_result=%s",
+        session_id, name, decision, tool_result[:120],
+    )
+
+    state["messages"].append({
+        "role": "tool",
+        "tool_call_id": awaiting["tool_call_id"],
+        "content": tool_result,
+    })
+    yield ("tool_result", {"name": name, "result": _truncate_tool_result(tool_result)})
+
+    async for event in _stream_react_rounds(
+        session_id, memory,
+        state["user_input"], state["messages"], state["tools"],
+        state["round_num"],
+        state["remaining_tool_calls"],
+        is_disconnected,
+    ):
+        yield event
 
 
 # ============================================================
@@ -631,6 +869,7 @@ async def stream_agent_response(
     memory: Memory,
     user_input: str,
     is_disconnected: Callable[[], Awaitable[bool]],
+    session_id: str = "",
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """ReAct 流式循环,yield 抽象 (event_name, payload_dict) 元组,与 SSE/HTTP 层解耦。
 
@@ -641,17 +880,21 @@ async def stream_agent_response(
         - ("search_status", {"phase": str})      内置 web_search 阶段,仅 responses 模式
         - ("tool_call", {"name": str, "args": dict})
         - ("tool_result", {"name": str, "result": str})  result 已截断到 TOOL_RESULT_PREVIEW_CHARS
-        - ("done", {})                           正常结束
+        - ("await_user", {"tool_call_id":..., "name":..., "args":..., "kind": "input"|"approval"})
+                                                  HITL 工具触发,流即将关,等 /api/resume(仅 chat 模式)
+        - ("done", {})                           正常结束(也包括 HITL 中断时的"软关流")
         - ("error", {"message": str})            终止流的错误
 
     is_disconnected: 由调用方注入的"客户端是否断连"探测,在每个 chunk 之间被 await。
     HTTP 层传 `request.is_disconnected`(starlette Request 上的 bound method)。
 
+    session_id: chat 模式 HITL 用,作为 _PENDING 的 key;responses 模式忽略。
+
     API_MODE=chat 时走 native function calling 路径(_stream_chat_native),
     联网搜索默认开启(MCP WebSearch),通过 tool_call/tool_result 事件可见;不发 search_status。
     """
     if API_MODE == "chat":
-        async for event in _stream_chat_native(memory, user_input, is_disconnected):
+        async for event in _stream_chat_native(memory, user_input, is_disconnected, session_id):
             yield event
         return
 

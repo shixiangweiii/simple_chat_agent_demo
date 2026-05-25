@@ -14,7 +14,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
@@ -31,6 +31,8 @@ from chat_core import (  # noqa: E402
     HistoryNotFound,
     InvalidSessionId,
     MODEL,
+    PendingMismatch,
+    PendingNotFound,
     archive_session,
     delete_session,
     get_archive_path_if_exists,
@@ -38,6 +40,7 @@ from chat_core import (  # noqa: E402
     list_sessions,
     read_history,
     reset_session,
+    resume_chat_response,
     session_count,
     stream_agent_response,
 )
@@ -75,6 +78,19 @@ class ResetRequest(BaseModel):
 
 class ArchiveRequest(BaseModel):
     session_id: str
+
+
+class ResumeRequest(BaseModel):
+    """HITL resume 请求体。
+    decision 三态:
+        - "answer"  -> ask_user 工具,answer 字段是用户答复
+        - "approve" -> execute_shell_command 工具,同意执行
+        - "reject"  -> execute_shell_command 工具,拒绝;answer 字段是可选拒绝理由
+    """
+    session_id: str
+    tool_call_id: str
+    decision: Literal["answer", "approve", "reject"]
+    answer: str | None = None
 
 
 # ============================================================
@@ -115,7 +131,34 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         memory = get_or_load(req.session_id)
     except InvalidSessionId:
         raise HTTPException(status_code=400, detail="invalid session_id")
-    events = stream_agent_response(memory, req.message, request.is_disconnected)
+    events = stream_agent_response(memory, req.message, request.is_disconnected, req.session_id)
+    return StreamingResponse(
+        _sse_stream(events),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/resume")
+async def resume(req: ResumeRequest, request: Request) -> StreamingResponse:
+    """HITL resume 入口:用户对前端 HITL bubble 操作后调,业务层从 _PENDING 恢复 ReAct 续跑。
+
+    SSE 帧类型与 /api/chat 完全一致(含可能再次出现的 await_user)。
+    """
+    try:
+        events = resume_chat_response(
+            req.session_id,
+            req.tool_call_id,
+            req.decision,
+            req.answer,
+            request.is_disconnected,
+        )
+    except InvalidSessionId:
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    except PendingNotFound:
+        raise HTTPException(status_code=404, detail="no pending HITL for session")
+    except PendingMismatch:
+        raise HTTPException(status_code=409, detail="tool_call_id mismatch")
     return StreamingResponse(
         _sse_stream(events),
         media_type="text/event-stream",

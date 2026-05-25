@@ -250,6 +250,127 @@
     gap: 4px;
   }
   .tool-strip .tool-line { white-space: pre-wrap; word-break: break-all; }
+
+  /* ---------- HITL (Human-in-the-Loop) 气泡 ---------- */
+  .msg.hitl {
+    align-self: stretch;
+    max-width: 78%;
+    margin: 8px 0;
+    padding: 12px 14px 12px 16px;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
+    border-left: 4px solid #f59e0b;
+    border-radius: 10px;
+    color: #1f2328;
+    font-size: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .hitl-header {
+    font-size: 12px;
+    color: #92400e;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .hitl-question {
+    white-space: pre-wrap;
+    line-height: 1.55;
+  }
+  .hitl-reason {
+    font-size: 12.5px;
+    color: var(--text-muted);
+    border-left: 2px solid #e5e7eb;
+    padding-left: 8px;
+    white-space: pre-wrap;
+  }
+  .hitl-command {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: #1f2328;
+  }
+  .hitl-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .hitl-opt {
+    background: #fff;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 10px;
+    border-radius: 14px;
+    font-size: 12.5px;
+    cursor: pointer;
+    transition: background 0.1s, border-color 0.1s;
+  }
+  .hitl-opt:hover { background: var(--hover); border-color: var(--primary); }
+  .hitl-input {
+    width: 100%;
+    resize: vertical;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 13.5px;
+    font-family: inherit;
+    min-height: 56px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .hitl-input:focus { border-color: var(--primary); }
+  .hitl-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+  .hitl-btn {
+    border: none;
+    padding: 6px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+  }
+  .hitl-submit { background: var(--primary); color: #fff; }
+  .hitl-submit:hover:not(:disabled) { background: var(--primary-hover); }
+  .hitl-approve { background: #16a34a; color: #fff; }
+  .hitl-approve:hover:not(:disabled) { background: #15803d; }
+  .hitl-reject { background: var(--danger); color: #fff; }
+  .hitl-reject:hover:not(:disabled) { background: #b91c1c; }
+  .hitl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .msg.hitl.resolved {
+    background: #f5f5f4;
+    border-color: #e7e5e4;
+    border-left-color: #a8a29e;
+    opacity: 0.78;
+  }
+  .msg.hitl.resolved .hitl-header::after {
+    content: '已处理';
+    margin-left: 6px;
+    padding: 1px 6px;
+    background: #e7e5e4;
+    color: #57534e;
+    border-radius: 8px;
+    font-weight: 500;
+    font-size: 11px;
+  }
+  .hitl-resolved-tag {
+    display: none;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+  .msg.hitl.resolved .hitl-resolved-tag { display: inline; }
   .thinking-panel {
     background: #fafafa;
     border: 1px solid #ececec;
@@ -1017,6 +1138,9 @@
 
   async function switchTo(sid) {
     if (sid === SESSION_ID) return;
+    // 离开当前会话,把未决 HITL bubble 灰化(后端 _PENDING 项保留,下次同 session 的
+    // /api/chat 会自动清理;此处只切断前端交互入口)
+    if (currentHitlBubble) markHitlResolved(currentHitlBubble, '已离开会话');
     SESSION_ID = sid;
     localStorage.setItem('sid', sid);
     updateHeaderSid();
@@ -1046,6 +1170,8 @@
   }
 
   async function newSession() {
+    // 离开当前会话:未决 HITL bubble 灰化
+    if (currentHitlBubble) markHitlResolved(currentHitlBubble, '已新建会话');
     // 静默归档当前(空 session 服务端会跳过)
     await archiveCurrent(true);
     SESSION_ID = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()));
@@ -1082,6 +1208,165 @@
   }
 
   // ---------- chat ----------
+  // 当前未决 HITL bubble 引用(切换会话/新建会话时灰化)
+  let currentHitlBubble = null;
+
+  function markHitlResolved(div, resolvedNote = '') {
+    if (!div) return;
+    div.classList.add('resolved');
+    // 禁用所有交互
+    div.querySelectorAll('button, textarea, .hitl-opt').forEach((el) => {
+      el.disabled = true;
+      if (el.classList && el.classList.contains('hitl-opt')) {
+        el.style.pointerEvents = 'none';
+      }
+    });
+    if (resolvedNote) {
+      const tag = div.querySelector('.hitl-resolved-tag');
+      if (tag) tag.textContent = resolvedNote;
+    }
+    if (currentHitlBubble === div) currentHitlBubble = null;
+  }
+
+  // 构造一个 AI 流式上下文 —— send() 和 consumeResumeStream() 共用
+  function createAiStreamContext() {
+    const aiDiv = addMessage('ai', '<span class="thinking-placeholder">思考中<span class="thinking-dots"></span></span>');
+    const $think = aiDiv.querySelector('.thinking-panel');
+    const $thinkBody = aiDiv.querySelector('.thinking-body');
+    const $thinkSummary = aiDiv.querySelector('.thinking-panel summary');
+    const $toolStrip = aiDiv.querySelector('.tool-strip');
+    const $answer = aiDiv.querySelector('.answer-body');
+    const $searchStatus = aiDiv.querySelector('.search-status');
+    const thinkTextNode = document.createTextNode('');
+    $thinkBody.appendChild(thinkTextNode);
+
+    const ctx = {
+      aiDiv, $think, $thinkBody, $thinkSummary, $toolStrip, $answer, $searchStatus,
+      thinkTextNode,
+      answerBuf: '', thinkStartTs: 0, answeringFlipped: false, answerStarted: false,
+      searchFadeTimer: 0,
+      awaitingUser: false,  // 流以 await_user 收尾时置 true,跳过 done 的"(无内容)"占位
+    };
+
+    ctx.flipToAnswering = function () {
+      if (ctx.answeringFlipped) return;
+      ctx.answeringFlipped = true;
+      if (ctx.thinkStartTs) {
+        const elapsed = (Date.now() - ctx.thinkStartTs) / 1000;
+        ctx.$think.open = false;
+        ctx.$thinkSummary.textContent = `💭 思考过程（用时 ${elapsed.toFixed(1)} s）`;
+      }
+    };
+    ctx.appendAnswer = function (text) {
+      if (!ctx.answerStarted) {
+        ctx.answerStarted = true;
+        ctx.$answer.innerHTML = '';
+      }
+      ctx.answerBuf += text;
+      ctx.$answer.innerHTML = renderMarkdown(ctx.answerBuf);
+      scrollToBottom();
+    };
+    ctx.pushTool = function (label) {
+      ctx.$toolStrip.hidden = false;
+      const line = document.createElement('div');
+      line.className = 'tool-line';
+      line.textContent = label;
+      ctx.$toolStrip.appendChild(line);
+      scrollToBottom();
+    };
+    ctx.showSearchStatus = function (phase) {
+      const map = {
+        in_progress: '🔍 联网搜索准备中…',
+        searching:   '🔍 正在搜索网络…',
+        completed:   '✅ 网络搜索完成',
+      };
+      const label = map[phase];
+      if (!label) return;
+      if (ctx.searchFadeTimer) { clearTimeout(ctx.searchFadeTimer); ctx.searchFadeTimer = 0; }
+      ctx.$searchStatus.textContent = label;
+      ctx.$searchStatus.classList.remove('fading');
+      ctx.$searchStatus.classList.add('visible');
+      if (phase === 'completed') {
+        ctx.searchFadeTimer = setTimeout(() => ctx.$searchStatus.classList.add('fading'), 1500);
+      }
+      scrollToBottom();
+    };
+    ctx.clearSearchStatus = function () {
+      if (ctx.searchFadeTimer) { clearTimeout(ctx.searchFadeTimer); ctx.searchFadeTimer = 0; }
+      ctx.$searchStatus.classList.remove('visible', 'fading');
+    };
+    return ctx;
+  }
+
+  // SSE 流消费循环 —— 共用 dispatch
+  async function consumeStream(reader, ctx) {
+    const decoder = new TextDecoder();
+    let raw = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      raw += decoder.decode(value, { stream: true });
+      const blocks = raw.split('\n\n');
+      raw = blocks.pop();
+      for (const block of blocks) {
+        if (!block.trim()) continue;
+        const ev = parseSSEBlock(block);
+        if (ev.event === 'thinking') {
+          if (!ctx.thinkStartTs) {
+            ctx.thinkStartTs = Date.now();
+            ctx.$think.hidden = false;
+            ctx.$think.open = true;
+          }
+          const piece = (ev.data && ev.data.text) || '';
+          if (piece) ctx.thinkTextNode.appendData(piece);
+          ctx.$thinkBody.scrollTop = ctx.$thinkBody.scrollHeight;
+          scrollToBottom();
+        } else if (ev.event === 'chunk') {
+          ctx.flipToAnswering();
+          ctx.appendAnswer((ev.data && ev.data.text) || '');
+        } else if (ev.event === 'status') {
+          if (ev.data && ev.data.phase === 'answering') ctx.flipToAnswering();
+        } else if (ev.event === 'tool_call') {
+          ctx.pushTool(`🛠 调用工具: ${ev.data.name} ${JSON.stringify(ev.data.args)}`);
+        } else if (ev.event === 'tool_result') {
+          ctx.pushTool(`✓ 工具 ${ev.data.name} 已返回结果`);
+        } else if (ev.event === 'search_status') {
+          ctx.showSearchStatus(ev.data && ev.data.phase);
+        } else if (ev.event === 'await_user') {
+          // HITL 中断:渲染 HITL bubble,本流即将结束(后端会紧接着发 done)
+          ctx.flipToAnswering();
+          ctx.clearSearchStatus();
+          ctx.awaitingUser = true;
+          addHitlBubble(ev.data || {});
+        } else if (ev.event === 'error') {
+          ctx.flipToAnswering();
+          ctx.clearSearchStatus();
+          const msg = (ev.data && ev.data.message) || '未知错误';
+          if (!ctx.answerStarted) {
+            ctx.answerStarted = true;
+            ctx.$answer.innerHTML = `<span class="error-text">⚠ ${escapeHtml(msg)}</span>`;
+          } else {
+            ctx.answerBuf += `\n\n**⚠ ${msg}**`;
+            ctx.$answer.innerHTML = renderMarkdown(ctx.answerBuf);
+          }
+          scrollToBottom();
+        } else if (ev.event === 'done') {
+          ctx.clearSearchStatus();
+          if (ctx.awaitingUser) {
+            // HITL 中断态:答复区若为空,不需要"(无内容)"占位 —— 答复在 HITL bubble 之后才会有
+            if (!ctx.answerStarted) {
+              ctx.$answer.innerHTML = '<span class="thinking-placeholder" style="font-style:italic;">⏸ 等待用户操作…</span>';
+            }
+          } else if (!ctx.answerStarted) {
+            ctx.$answer.innerHTML = '<span class="thinking-placeholder">(无内容)</span>';
+          } else {
+            renderMermaidIn(ctx.$answer);  // fire-and-forget
+          }
+        }
+      }
+    }
+  }
+
   async function send() {
     const text = $input.value.trim();
     if (!text || $send.disabled) return;
@@ -1092,72 +1377,7 @@
     autoResize();
     setStreaming(true);
 
-    const aiDiv = addMessage('ai', '<span class="thinking-placeholder">思考中<span class="thinking-dots"></span></span>');
-    const $think = aiDiv.querySelector('.thinking-panel');
-    const $thinkBody = aiDiv.querySelector('.thinking-body');
-    const $thinkSummary = aiDiv.querySelector('.thinking-panel summary');
-    const $toolStrip = aiDiv.querySelector('.tool-strip');
-    const $answer = aiDiv.querySelector('.answer-body');
-    const $searchStatus = aiDiv.querySelector('.search-status');
-
-    // 思考面板用增量 text node 追加，避免每个 chunk 全量重写造成的 O(N²) DOM 操作
-    const thinkTextNode = document.createTextNode('');
-    $thinkBody.appendChild(thinkTextNode);
-
-    let answerBuf = '';
-    let thinkStartTs = 0;
-    let answeringFlipped = false;
-    let answerStarted = false;
-
-    function flipToAnswering() {
-      if (answeringFlipped) return;
-      answeringFlipped = true;
-      if (thinkStartTs) {
-        const elapsed = (Date.now() - thinkStartTs) / 1000;
-        $think.open = false;
-        $thinkSummary.textContent = `💭 思考过程（用时 ${elapsed.toFixed(1)} s）`;
-      }
-    }
-    function appendAnswer(text) {
-      if (!answerStarted) {
-        answerStarted = true;
-        $answer.innerHTML = '';
-      }
-      answerBuf += text;
-      $answer.innerHTML = renderMarkdown(answerBuf);
-      scrollToBottom();
-    }
-    function pushTool(label) {
-      $toolStrip.hidden = false;
-      const line = document.createElement('div');
-      line.className = 'tool-line';
-      line.textContent = label;
-      $toolStrip.appendChild(line);
-      scrollToBottom();
-    }
-    let searchFadeTimer = 0;
-    function showSearchStatus(phase) {
-      const map = {
-        in_progress: '🔍 联网搜索准备中…',
-        searching:   '🔍 正在搜索网络…',
-        completed:   '✅ 网络搜索完成',
-      };
-      const label = map[phase];
-      if (!label) return;
-      if (searchFadeTimer) { clearTimeout(searchFadeTimer); searchFadeTimer = 0; }
-      $searchStatus.textContent = label;
-      $searchStatus.classList.remove('fading');
-      $searchStatus.classList.add('visible');
-      if (phase === 'completed') {
-        searchFadeTimer = setTimeout(() => $searchStatus.classList.add('fading'), 1500);
-      }
-      scrollToBottom();
-    }
-    function clearSearchStatus() {
-      if (searchFadeTimer) { clearTimeout(searchFadeTimer); searchFadeTimer = 0; }
-      $searchStatus.classList.remove('visible', 'fading');
-    }
-
+    const ctx = createAiStreamContext();
     try {
       const resp = await fetch('/api/chat', {
         method: 'POST',
@@ -1165,69 +1385,171 @@
         body: JSON.stringify({ session_id: SESSION_ID, message: text }),
       });
       if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
-
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let raw = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        raw += decoder.decode(value, { stream: true });
-        const blocks = raw.split('\n\n');
-        raw = blocks.pop();
-        for (const block of blocks) {
-          if (!block.trim()) continue;
-          const ev = parseSSEBlock(block);
-          if (ev.event === 'thinking') {
-            if (!thinkStartTs) {
-              thinkStartTs = Date.now();
-              $think.hidden = false;
-              $think.open = true;
-            }
-            const piece = (ev.data && ev.data.text) || '';
-            if (piece) thinkTextNode.appendData(piece);
-            $thinkBody.scrollTop = $thinkBody.scrollHeight;
-            scrollToBottom();
-          } else if (ev.event === 'chunk') {
-            flipToAnswering();
-            appendAnswer((ev.data && ev.data.text) || '');
-          } else if (ev.event === 'status') {
-            if (ev.data && ev.data.phase === 'answering') {
-              flipToAnswering();
-            }
-          } else if (ev.event === 'tool_call') {
-            pushTool(`🛠 调用工具: ${ev.data.name} ${JSON.stringify(ev.data.args)}`);
-          } else if (ev.event === 'tool_result') {
-            pushTool(`✓ 工具 ${ev.data.name} 已返回结果`);
-          } else if (ev.event === 'search_status') {
-            showSearchStatus(ev.data && ev.data.phase);
-          } else if (ev.event === 'error') {
-            flipToAnswering();
-            clearSearchStatus();
-            const msg = (ev.data && ev.data.message) || '未知错误';
-            if (!answerStarted) {
-              answerStarted = true;
-              $answer.innerHTML = `<span class="error-text">⚠ ${escapeHtml(msg)}</span>`;
-            } else {
-              answerBuf += `\n\n**⚠ ${msg}**`;
-              $answer.innerHTML = renderMarkdown(answerBuf);
-            }
-            scrollToBottom();
-          } else if (ev.event === 'done') {
-            clearSearchStatus();
-            if (!answerStarted) {
-              $answer.innerHTML = '<span class="thinking-placeholder">(无内容)</span>';
-            } else {
-              renderMermaidIn($answer);  // fire-and-forget,内容稳定后异步替换 mermaid 为 SVG
-            }
-          }
-        }
-      }
+      await consumeStream(resp.body.getReader(), ctx);
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
-      flipToAnswering();
-      $answer.innerHTML = `<span class="error-text">⚠ 网络错误: ${escapeHtml(msg)}</span>`;
+      ctx.flipToAnswering();
+      ctx.$answer.innerHTML = `<span class="error-text">⚠ 网络错误: ${escapeHtml(msg)}</span>`;
+    } finally {
+      setStreaming(false);
+      $input.focus();
+    }
+  }
+
+  // ---------- HITL bubble ----------
+  function addHitlBubble(payload) {
+    const $emptyEl = document.getElementById('empty');
+    if ($emptyEl) $emptyEl.remove();
+    const div = document.createElement('div');
+    div.className = 'msg hitl';
+    div.dataset.toolCallId = payload.tool_call_id || '';
+    div.dataset.kind = payload.kind || '';
+
+    const args = payload.args || {};
+    const isInput = payload.kind === 'input';
+
+    // 头部:工具图标 + 标签 + "已处理" tag 占位
+    const header = document.createElement('div');
+    header.className = 'hitl-header';
+    header.innerHTML = `${isInput ? '💬' : '⚠️'} <span>${isInput ? '需要你的回答' : '需要你的审批'}</span><span class="hitl-resolved-tag"></span>`;
+    div.appendChild(header);
+
+    if (isInput) {
+      // ask_user:question + 可选 options chip + textarea + 提交按钮
+      const q = document.createElement('div');
+      q.className = 'hitl-question';
+      q.textContent = args.question || '(无问题文本)';
+      div.appendChild(q);
+
+      const textarea = document.createElement('textarea');
+      textarea.className = 'hitl-input';
+      textarea.placeholder = '在此输入答复…(Cmd/Ctrl+Enter 提交)';
+
+      const opts = Array.isArray(args.options) ? args.options : [];
+      if (opts.length > 0) {
+        const optsWrap = document.createElement('div');
+        optsWrap.className = 'hitl-options';
+        for (const o of opts) {
+          const chip = document.createElement('button');
+          chip.type = 'button';
+          chip.className = 'hitl-opt';
+          chip.textContent = String(o);
+          chip.addEventListener('click', () => {
+            textarea.value = String(o);
+            textarea.focus();
+          });
+          optsWrap.appendChild(chip);
+        }
+        div.appendChild(optsWrap);
+      }
+      div.appendChild(textarea);
+
+      const actions = document.createElement('div');
+      actions.className = 'hitl-actions';
+      const submit = document.createElement('button');
+      submit.type = 'button';
+      submit.className = 'hitl-btn hitl-submit';
+      submit.textContent = '提交答复';
+      submit.addEventListener('click', () => {
+        const answer = textarea.value.trim();
+        if (!answer) { textarea.focus(); return; }
+        markHitlResolved(div, `已答复: ${answer.slice(0, 40)}${answer.length > 40 ? '…' : ''}`);
+        consumeResumeStream({
+          tool_call_id: payload.tool_call_id,
+          decision: 'answer',
+          answer,
+        });
+      });
+      actions.appendChild(submit);
+      div.appendChild(actions);
+
+      textarea.addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+          e.preventDefault();
+          submit.click();
+        }
+      });
+      setTimeout(() => textarea.focus(), 0);
+    } else {
+      // execute_shell_command:命令 + 理由 + 同意/拒绝
+      if (args.command) {
+        const cmd = document.createElement('div');
+        cmd.className = 'hitl-command';
+        cmd.textContent = args.command;
+        div.appendChild(cmd);
+      }
+      if (args.reason) {
+        const reason = document.createElement('div');
+        reason.className = 'hitl-reason';
+        reason.textContent = `理由: ${args.reason}`;
+        div.appendChild(reason);
+      }
+
+      // 可选拒绝理由 textarea(隐藏的,点拒绝时若想填可见)
+      const rejectReason = document.createElement('textarea');
+      rejectReason.className = 'hitl-input';
+      rejectReason.placeholder = '可选:拒绝理由(模型会看到)';
+      rejectReason.style.minHeight = '40px';
+      div.appendChild(rejectReason);
+
+      const actions = document.createElement('div');
+      actions.className = 'hitl-actions';
+      const approve = document.createElement('button');
+      approve.type = 'button';
+      approve.className = 'hitl-btn hitl-approve';
+      approve.textContent = '✓ 同意执行';
+      approve.addEventListener('click', () => {
+        markHitlResolved(div, '已同意');
+        consumeResumeStream({
+          tool_call_id: payload.tool_call_id,
+          decision: 'approve',
+          answer: null,
+        });
+      });
+      const reject = document.createElement('button');
+      reject.type = 'button';
+      reject.className = 'hitl-btn hitl-reject';
+      reject.textContent = '✗ 拒绝';
+      reject.addEventListener('click', () => {
+        const reason = rejectReason.value.trim() || null;
+        markHitlResolved(div, '已拒绝');
+        consumeResumeStream({
+          tool_call_id: payload.tool_call_id,
+          decision: 'reject',
+          answer: reason,
+        });
+      });
+      actions.appendChild(reject);
+      actions.appendChild(approve);
+      div.appendChild(actions);
+    }
+
+    $messages.appendChild(div);
+    currentHitlBubble = div;
+    scrollToBottom(true);
+  }
+
+  // resume 流消费 —— 新建 aiDiv 承接 resume 后续(可能再触发 HITL,可能直接答复)
+  async function consumeResumeStream(body) {
+    if (!SESSION_ID) { showToast('会话未就绪,无法提交', true); return; }
+    setStreaming(true);
+    const ctx = createAiStreamContext();
+    try {
+      const resp = await fetch('/api/resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID, ...body }),
+      });
+      if (!resp.ok || !resp.body) {
+        let detail = `HTTP ${resp.status}`;
+        try { const j = await resp.json(); if (j && j.detail) detail += ` ${j.detail}`; } catch (e) { /* noop */ }
+        throw new Error(detail);
+      }
+      await consumeStream(resp.body.getReader(), ctx);
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      ctx.flipToAnswering();
+      ctx.$answer.innerHTML = `<span class="error-text">⚠ resume 失败: ${escapeHtml(msg)}</span>`;
     } finally {
       setStreaming(false);
       $input.focus();
@@ -1259,6 +1581,7 @@
     } catch (e) {
       showToast('重置失败: ' + e.message, true);
     }
+    currentHitlBubble = null;  // reset 会 innerHTML='',旧引用作废
     showEmptyPlaceholder('已清空对话。');
     await loadSessions();
   });
