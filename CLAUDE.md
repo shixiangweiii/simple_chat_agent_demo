@@ -40,7 +40,7 @@ web_chat_agent.py     (HTTP 入口)─┘   (业务逻辑层)    └─→ mcp_w
 | Layer | File | Responsibilities | Forbidden |
 |---|---|---|---|
 | Entry / HTTP | `common_chat_agent.py`, `web_chat_agent.py` | CLI loop, FastAPI routes, Pydantic models, SSE serialization (`sse()` + `_sse_stream`), domain-exception → HTTPException translation | Direct OpenAI SDK use, ReAct logic, Memory serialization, session disk I/O |
-| 业务逻辑 | `chat_core.py` | `Memory` + serialization, `USER_PROMPT` / `TOOLS` / `MAX_ROUNDS` / `TOOL_RESULT_PREVIEW_CHARS`, ReAct primitives (`match_tool_action` / `parse_action_input` / `execute_tool` / `build_prompt`), `react()` (CLI), `stream_agent_response()` (Web, yields abstract `(event_name, payload)` tuples), chat-mode native function-calling ReAct (`_react_chat_native` / `_stream_chat_native` / `_stream_react_rounds` / `_memory_to_messages` / `_build_native_tools[_async]`), HITL 基础设施 (`LOCAL_TOOLS` / `_LOCAL_TOOL_KIND` / `_PENDING` / `resume_chat_response` + `_resume_inner`), session storage (`sessions` / `get_or_load` / `archive_session` / `reset_session` / `delete_session` / `list_sessions` / `read_history` / `get_archive_path_if_exists` / `session_count`), domain exceptions (`InvalidSessionId` / `HistoryNotFound` / `PendingNotFound` / `PendingMismatch`); re-exports `MODEL` / `API_MODE` so entry points need not import `llm_client` directly | Importing fastapi / starlette, formatting SSE strings, raising HTTPException |
+| 业务逻辑 | `chat_core.py` | `Memory` + serialization, `USER_PROMPT` / `TOOLS` / `MAX_ROUNDS` / `TOOL_RESULT_PREVIEW_CHARS`, ReAct primitives (`match_tool_action` / `parse_action_input` / `execute_tool` / `build_prompt`), `react()` (CLI), `stream_agent_response()` (Web, yields abstract `(event_name, payload)` tuples), 上下文感知 (`_compute_adaptive_prompt`), chat-mode native function-calling ReAct (`_react_chat_native` / `_stream_chat_native` / `_stream_react_rounds` / `_memory_to_messages` / `_build_native_tools[_async]`), HITL 基础设施 (`LOCAL_TOOLS` / `_LOCAL_TOOL_KIND` / `_PENDING` / `resume_chat_response` + `_resume_inner`), session storage (`sessions` / `get_or_load` / `archive_session` / `reset_session` / `delete_session` / `list_sessions` / `read_history` / `get_archive_path_if_exists` / `session_count`), domain exceptions (`InvalidSessionId` / `HistoryNotFound` / `PendingNotFound` / `PendingMismatch`); re-exports `MODEL` / `API_MODE` so entry points need not import `llm_client` directly | Importing fastapi / starlette, formatting SSE strings, raising HTTPException |
 | LLM 底层 | `llm_client.py` | `MODEL` / `API_MODE` env parsing, `_get_client()` cached singleton, `llm()` (sync, CLI) + `_llm_responses` / `_llm_chat`, `llm_stream()` (async, Web) + `_llm_stream_responses` / `_llm_stream_chat`, `llm_chat_with_tools` / `llm_stream_chat_with_tools` (chat 模式 native function calling 入口) + `_llm_*_chat_with_tools` impls + `_accumulate_tool_call_chunk` / `_finalize_tool_calls` 拼装器, `_extract_output_text` fallback, embedded-error chunk detection, all chunk-type logging | Importing chat_core / fastapi, knowing about Memory / Sessions / SSE / MCP |
 | MCP 客户端 | `mcp_web_search.py` | streamableHttp 封装 DashScope WebSearch MCP server: `discover_tool_spec[_async]` (一次性读 schema 并缓存为 OpenAI tools 格式) + `call_tool_async` / `call_tool_sync` (短连接发起一次工具调用,失败返回错误字符串而不抛) | Importing chat_core / llm_client / fastapi, knowing about Memory / SSE / ReAct / OpenAI tool_calls 拼装 |
 
@@ -74,6 +74,14 @@ When adding a feature, decide its layer first. UI behavior → entry layer. ReAc
    - **Right 200px anchor panel**: TOC of every user message in the current chat. Click → smooth-scroll + 1.2s flash. An `IntersectionObserver` highlights the topmost in-view user message (only the top 40% of the chat viewport counts as "in view" via `rootMargin: '0px 0px -60% 0px'`, to keep the active state stable as the user reads downward).
    - **Archive-preview modal**: fullscreen overlay opened by the header 📄 button. Fetches `GET /api/sessions/{sid}/raw` and renders two tabs (Rendered / Source). The Rendered tab parses the markdown's HTML-comment metadata + `<!-- turn: 用户|AI -->` blocks, runs **user content through `textContent`** and **AI content through `renderMarkdown`** (DOMPurify+marked) — same XSS boundary as the chat view. Empty state shows an "立即归档" CTA that calls `archiveCurrent()` then re-opens the modal.
 
+### 上下文感知（Phase 2）
+
+前端每次 `/api/chat` 请求附带 `context` 字段（`viewport_width` / `selected_text` / `session_message_count`）。`stream_agent_response` 调 `_compute_adaptive_prompt(context, memory)` 得到 `(adaptive_fragment, ui_mode)`:
+- `adaptive_fragment` 注入 system prompt（`build_prompt` / `_memory_to_messages` 均支持），影响模型行为。
+- `ui_mode` 若非 `"chat"` 则在流开头 yield `("ui_hint", {"mode": ...})`，前端据此切换布局（`compact` 折叠历史 / `focus` 提示选中文本）。
+
+管道设计刻意精简（单函数、3 信号、1 维判断），教学目标是演示**数据链路**而非分类器复杂度。
+
 ### LLM API mode switch
 
 `API_MODE` env var (default `responses`) toggles the underlying call protocol **and** the联网搜索实现路径。两套路径都汇聚到 `chat_core.stream_agent_response()` 同一个 SSE 事件契约上,前端零分支。
@@ -103,7 +111,7 @@ Key behavioral differences:
 - `_memory_to_messages(memory, system_prompt, user_input)` — 把 flat-string Memory 转成 OpenAI messages 数组(`Memory.USER → "user"`, `Memory.AI → "assistant"`). **只**在每个 user turn 入口调一次,Memory 存储格式不变。`tool_call_id` 链接只在单个 turn 内活,循环结束只把 final assistant content 写回 Memory。
 - `_build_native_tools[_async]()` — 模块级懒加载,首次调用走 `mcp_web_search.discover_tool_spec[_async]()`(列出 MCP server 暴露的所有工具的 OpenAI tools 格式 spec),并 extend `LOCAL_TOOLS.values()`(HITL 伪工具),合并结果缓存到 `_NATIVE_TOOLS_CACHE`。
 - `_react_chat_native(memory, user_input)` — 同步循环,CLI 用。受 `MAX_ROUNDS` 保护,模型不再返回 tool_calls 即退出并返回 final content。CLI 物理上做不了 HITL,所以遇到 `LOCAL_TOOLS` 中的工具时**短路**:直接喂回固定错误字符串 `"[HITL 工具 X 在 CLI 模式下不可用,请直接以文本方式向用户说明或寻求其他途径]"`,让模型在循环里恢复(改回纯文本提问 / 放弃 shell)。
-- `_stream_chat_native(session_id, memory, user_input, is_disconnected)` — 异步流式循环的**薄壳**,Web 用。仅做三件事:`_PENDING.pop(session_id, None)` 清旧 pending、`await _build_native_tools_async()` 拿工具集、把所有参数转交给 `_stream_react_rounds(start_round=0, pending_remaining=[])`。`session_id` 参数自 HITL 引入,沿调用链 `stream_agent_response(..., session_id=req.session_id)` 透传下来,responses 模式忽略它。
+- `_stream_chat_native(memory, user_input, is_disconnected, session_id, adaptive_fragment="")` — 异步流式循环的**薄壳**,Web 用。仅做三件事:`_PENDING.pop(session_id, None)` 清旧 pending、`await _build_native_tools_async()` 拿工具集、把所有参数转交给 `_stream_react_rounds(start_round=0, pending_remaining=[])`。`session_id` 参数自 HITL 引入,沿调用链 `stream_agent_response(..., session_id=req.session_id)` 透传下来,responses 模式忽略它。`adaptive_fragment` 由 `_compute_adaptive_prompt` 计算后透传,注入 system prompt。
 - `_stream_react_rounds(session_id, memory, user_input, messages, tools, start_round, pending_remaining, is_disconnected)` — 真正的 ReAct 循环主体,**双入口**:fresh start(`start_round=0, pending_remaining=[]`)与 resume(`start_round=断点轮次, pending_remaining=断点未消费的 tool_calls`)。每轮先决:若 `pending_remaining` 非空(只可能是 resume 的第一轮),**跳过 LLM 调用**,直接把它当 `accumulated_tool_calls` 进入派发;否则正常调 LLM,无 tool_calls 即写 Memory + `done` 退出。Tool 派发循环按 name 分发:若 `tc["name"] in LOCAL_TOOLS`,把"剩余队列 + awaiting 元信息"写入 `_PENDING[session_id]`,yield `("await_user", ...)` + `("done", {})` 关流,return;否则调 `mcp_web_search.call_tool_async`,把结果以 role=tool 追加进 messages,继续。MCP 调用失败返回 `"工具调用失败: ..."` 字符串,**不**抛异常。`is_disconnected` 在每个 chunk 之间和每个 tool_call 之间都被 `await`。
 
 **HITL 中断与 resume**:
@@ -156,7 +164,7 @@ Serialization lives on `Memory.to_markdown(session_id)` / `Memory.from_markdown(
 |---|---|---|
 | `GET` | `/` | Static `index.html` |
 | `GET` | `/api/health` | `{ok, model, sessions}` count |
-| `POST` | `/api/chat` | SSE stream (see contract below) |
+| `POST` | `/api/chat` | SSE stream (see contract below). Body: `{session_id, message, context?}`, context 含 `viewport_width` / `selected_text` / `session_message_count` |
 | `POST` | `/api/resume` | HITL resume:body `{session_id, tool_call_id, decision: "answer"\|"approve"\|"reject", answer?}`,启**新**SSE 流继续 ReAct 循环。404 = 该 session 无 pending HITL;409 = `tool_call_id` 与 pending awaiting 不匹配(pending 会被还回去允许重试)。仅 `API_MODE=chat` + HITL 工具触发时才会有 pending 可恢复。 |
 | `POST` | `/api/reset` | Clear current session memory + delete archive; session_id preserved |
 | `POST` | `/api/archive` | Cover-write current Memory to disk; empty → `{ok, skipped:true}` |
@@ -178,6 +186,7 @@ All payloads are JSON.
 | `tool_call` | `{name, args}` | About to invoke a tool. `responses` 模式下当前为空(自定义 `TOOLS` 为空);`chat` 模式 native function calling 路径上,每次模型 `tool_calls` 触发都发(典型即 MCP `web_search`)。 |
 | `tool_result` | `{name, result}` | Tool returned. `result` is truncated to `TOOL_RESULT_PREVIEW_CHARS` (500) for UI; full text in server log. `chat` 模式下与 `tool_call` 成对出现,前端 tool-strip 渲染。 |
 | `await_user` | `{tool_call_id, name, args, kind: "input"\|"approval"}` | HITL 中断 —— 模型调了 `LOCAL_TOOLS` 中的工具,业务层把状态写入 `_PENDING`,前端按 `kind` 渲染 bubble(input = textarea+提交;approval = 同意/拒绝按钮)。**仅 `chat` 模式 + HITL 工具(`ask_user` / `execute_shell_command`)触发**;紧随其后一定是 `done` 关流,等用户操作触发 `POST /api/resume` 启新流。 |
+| `ui_hint` | `{mode: "focus"\|"compact"\|"chat"}` | 上下文感知推荐的 UI 模式(Phase 2)。在流开头发(第一帧),前端据此切换布局。`focus` = 选中文本提示;`compact` = 折叠历史。仅 `mode != "chat"` 时发。 |
 | `done` | `{}` | Normal end of stream. HITL 中断也会发(关流让前端不再 read)。 |
 | `error` | `{message}` | LLM / tool / parsing error — terminal. |
 | `component_loading` | `{component_type, tool_call_id, placeholder_text}` | 工具开始执行,前端占位渲染 loading 态。**仅 `chat` 模式 + `TOOL_COMPONENT_MAP` 注册的工具触发。** |

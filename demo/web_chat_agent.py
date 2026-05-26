@@ -70,6 +70,7 @@ app = FastAPI(title="Simple Chat Agent")
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+    context: dict | None = None
 
 
 class ResetRequest(BaseModel):
@@ -131,7 +132,7 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         memory = get_or_load(req.session_id)
     except InvalidSessionId:
         raise HTTPException(status_code=400, detail="invalid session_id")
-    events = stream_agent_response(memory, req.message, request.is_disconnected, req.session_id)
+    events = stream_agent_response(memory, req.message, request.is_disconnected, req.session_id, req.context)
     return StreamingResponse(
         _sse_stream(events),
         media_type="text/event-stream",

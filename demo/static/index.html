@@ -791,6 +791,18 @@
     font-size: 12.5px;
     color: #991b1b;
   }
+
+  /* Phase 2: 上下文感知 UI hint */
+  #messages.compact-mode .msg:nth-last-child(n+7) { display: none; }
+  #messages.compact-mode::before {
+    content: '历史消息已折叠';
+    display: block; text-align: center;
+    color: #888; font-size: 12px; padding: 8px 0;
+  }
+  .focus-hint {
+    background: #e8f4fd; border-radius: 6px;
+    padding: 6px 12px; font-size: 12px; color: #1976d2; margin-bottom: 8px;
+  }
 </style>
 </head>
 <body>
@@ -1463,6 +1475,8 @@
           scrollToBottom();
         } else if (ev.event === 'search_status') {
           ctx.showSearchStatus(ev.data && ev.data.phase);
+        } else if (ev.event === 'ui_hint') {
+          applyUiHint(ev.data || {});
         } else if (ev.event === 'await_user') {
           // HITL 中断:渲染 HITL bubble,本流即将结束(后端会紧接着发 done)
           ctx.flipToAnswering();
@@ -1512,6 +1526,34 @@
     }
   }
 
+  function collectContext() {
+    return {
+      viewport_width: window.innerWidth,
+      selected_text: window.getSelection()?.toString()?.slice(0, 500) || null,
+      session_message_count: document.querySelectorAll('.msg.user').length,
+    };
+  }
+
+  function applyUiHint(data) {
+    const mode = data && data.mode;
+    const $el = document.getElementById('messages');
+    if (!$el) return;
+    // 清除之前的 hint 状态
+    $el.classList.remove('compact-mode');
+    const oldHint = $el.querySelector('.focus-hint');
+    if (oldHint) oldHint.remove();
+
+    if (mode === 'compact') {
+      $el.classList.add('compact-mode');
+    } else if (mode === 'focus') {
+      const hint = document.createElement('div');
+      hint.className = 'focus-hint';
+      hint.textContent = '针对选中文本回答';
+      $el.insertBefore(hint, $el.firstChild);
+    }
+    // mode === 'chat' → 仅清除，不做额外操作
+  }
+
   async function send() {
     const text = $input.value.trim();
     if (!text || $send.disabled) return;
@@ -1527,7 +1569,7 @@
       const resp = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: SESSION_ID, message: text }),
+        body: JSON.stringify({ session_id: SESSION_ID, message: text, context: collectContext() }),
       });
       if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
       await consumeStream(resp.body.getReader(), ctx);

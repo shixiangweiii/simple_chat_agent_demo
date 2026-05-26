@@ -396,17 +396,43 @@ def execute_tool(tool_name, params):
 
 
 # ============================================================
+# 上下文感知 —— Phase 2
+# ============================================================
+
+
+def _compute_adaptive_prompt(context: dict | None, memory: "Memory") -> tuple[str, str]:
+    """基于前端上报的上下文计算: (补充 system prompt 片段, ui_hint mode)。
+
+    仅做简单一维判断演示管道,不追求分类准确性。
+    """
+    msg_count = (context or {}).get("session_message_count", 0)
+    selected = (context or {}).get("selected_text")
+
+    if selected:
+        return (
+            f"用户选中了一段文本：「{selected[:200]}」，优先围绕选中内容回答。",
+            "focus",
+        )
+    if msg_count > 10:
+        return ("对话已较长，保持简洁，避免重复已说过的内容。", "compact")
+    return ("", "chat")
+
+
+# ============================================================
 # Prompt 拼装
 # ============================================================
 
-def build_prompt(user_prompt, tools, memory, latest_input):
+def build_prompt(user_prompt, tools, memory, latest_input, adaptive_fragment: str = ""):
     """拼装完整的 Prompt:
     - `tools == []`(常态):角色设定 + 对话记录 + 最新输入。完全不输出 ReAct 框架,
       避免"无工具"措辞反向压制 API 层的内置 web_search。
     - `tools` 非空:角色设定 + 工具列表 + ReAct 格式说明 + 注意事项 + 对话记录 + 最新输入。
       框架在 TOOLS 列表添加自定义工具时自动恢复。
     """
-    sections = [user_prompt, "---------------------"]
+    prompt_head = user_prompt
+    if adaptive_fragment:
+        prompt_head = user_prompt + "\n\n" + adaptive_fragment
+    sections = [prompt_head, "---------------------"]
 
     if tools:
         tool_names = ",".join(t["name"] for t in tools)
@@ -450,13 +476,18 @@ def build_prompt(user_prompt, tools, memory, latest_input):
 _NATIVE_TOOLS_CACHE: list[dict] | None = None
 
 
-def _memory_to_messages(memory: Memory, system_prompt: str, user_input: str) -> list[dict]:
+def _memory_to_messages(
+    memory: Memory, system_prompt: str, user_input: str, adaptive_fragment: str = "",
+) -> list[dict]:
     """把 flat-string Memory 转成 OpenAI Chat Completions messages 数组。
 
     仅用于 chat-mode-with-tools 路径。Memory 存储格式不变(仍是 role/msg 二元组)。
     角色映射: 用户 -> user, AI -> assistant; 不携带历史 tool_calls(单 turn 内才需要)。
     """
-    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    sys_content = system_prompt
+    if adaptive_fragment:
+        sys_content = system_prompt + "\n\n" + adaptive_fragment
+    messages: list[dict] = [{"role": "system", "content": sys_content}]
     for m in memory.memories:
         role = "user" if m["role"] == Memory.USER else "assistant"
         messages.append({"role": role, "content": m["msg"]})
@@ -774,16 +805,17 @@ async def _stream_chat_native(
     user_input: str,
     is_disconnected: Callable[[], Awaitable[bool]],
     session_id: str,
+    adaptive_fragment: str = "",
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """[chat 模式 + native function calling] 异步流式 ReAct 循环,Web 用。
 
     yield 的 (event_name, payload) 元组**完全复用**现有 SSE 契约,新增 await_user 一项:
         status / thinking / chunk / tool_call / tool_result / await_user / done / error
     """
-    # 新一轮 chat:清掉旧 pending,防止僵尸 _PENDING 项常驻
+    # 新一轮 chat：清掉旧 pending，防止僵尸 _PENDING 项常驻
     _PENDING.pop(session_id, None)
 
-    messages = _memory_to_messages(memory, USER_PROMPT, user_input)
+    messages = _memory_to_messages(memory, USER_PROMPT, user_input, adaptive_fragment)
     try:
         tools = await _build_native_tools_async()
     except Exception as exc:
@@ -928,6 +960,7 @@ async def stream_agent_response(
     user_input: str,
     is_disconnected: Callable[[], Awaitable[bool]],
     session_id: str = "",
+    context: dict | None = None,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """ReAct 流式循环,yield 抽象 (event_name, payload_dict) 元组,与 SSE/HTTP 层解耦。
 
@@ -940,6 +973,8 @@ async def stream_agent_response(
         - ("tool_result", {"name": str, "result": str})  result 已截断到 TOOL_RESULT_PREVIEW_CHARS
         - ("await_user", {"tool_call_id":..., "name":..., "args":..., "kind": "input"|"approval"})
                                                   HITL 工具触发,流即将关,等 /api/resume(仅 chat 模式)
+        - ("ui_hint", {"mode": "focus"|"compact"|"chat"})
+                                                  上下文感知推荐的 UI 模式(Phase 2)
         - ("done", {})                           正常结束(也包括 HITL 中断时的"软关流")
         - ("error", {"message": str})            终止流的错误
 
@@ -947,12 +982,18 @@ async def stream_agent_response(
     HTTP 层传 `request.is_disconnected`(starlette Request 上的 bound method)。
 
     session_id: chat 模式 HITL 用,作为 _PENDING 的 key;responses 模式忽略。
+    context: 前端上报的环境上下文(viewport_width, selected_text, session_message_count)。
 
     API_MODE=chat 时走 native function calling 路径(_stream_chat_native),
     联网搜索默认开启(MCP WebSearch),通过 tool_call/tool_result 事件可见;不发 search_status。
     """
+    adaptive_fragment, ui_mode = _compute_adaptive_prompt(context, memory)
+    yield ("ui_hint", {"mode": ui_mode})
+
     if API_MODE == "chat":
-        async for event in _stream_chat_native(memory, user_input, is_disconnected, session_id):
+        async for event in _stream_chat_native(
+            memory, user_input, is_disconnected, session_id, adaptive_fragment,
+        ):
             yield event
         return
 
@@ -961,7 +1002,7 @@ async def stream_agent_response(
 
     for round_num in range(MAX_ROUNDS):
         yield ("status", {"phase": "thinking", "round": round_num})
-        prompt = build_prompt(USER_PROMPT, TOOLS, memory, latest_input)
+        prompt = build_prompt(USER_PROMPT, TOOLS, memory, latest_input, adaptive_fragment)
         logger.info("ReAct 第 %d 轮开始:prompt_chars=%d latest_input_chars=%d memory_turns=%d",
                     round_num, len(prompt), len(latest_input), len(memory.memories))
         logger.info("prompt=\n%s", prompt)
