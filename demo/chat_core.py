@@ -493,6 +493,40 @@ def _truncate_tool_result(text: str) -> str:
     return text[:TOOL_RESULT_PREVIEW_CHARS] + f"...（截断，原文 {len(text)} 字符见 server log）"
 
 
+# ============================================================
+# Static Generative UI — 工具结果卡片化
+# ============================================================
+
+# 工具名 → 前端 component_type 映射。注册在此的工具执行后会额外触发 render_component 事件。
+TOOL_COMPONENT_MAP: dict[str, str] = {
+    "web_search": "search_results",
+}
+
+# 卡片 props 中 markdown 字段的最大长度。比 TOOL_RESULT_PREVIEW_CHARS(500)长,
+# 因为 tool_result 是调试预览(短即可),而卡片是用户主要消费媒介(需展示更多内容)。
+_COMPONENT_MARKDOWN_MAX_CHARS = 2000
+
+
+def _build_component_props(tool_name: str, args: dict, result_text: str) -> dict | None:
+    """根据工具名 + 参数 + 返回文本,构建前端组件 props。返回 None 表示不渲染(如工具失败)。"""
+    if tool_name == "web_search":
+        if result_text.startswith(mcp_web_search.ERROR_PREFIX):
+            return None
+        # MCP schema 中搜索词字段名为 "query",兼容早期版本可能出现的 "search_query"
+        query = args.get("query") or args.get("search_query") or ""
+        if len(result_text) > _COMPONENT_MARKDOWN_MAX_CHARS:
+            markdown = result_text[:_COMPONENT_MARKDOWN_MAX_CHARS] + "\n\n…（内容过长已截断）"
+        else:
+            markdown = result_text
+        return {"query": query, "markdown": markdown}
+    # 注册了 component_type 但没有 props 构建分支 — 开发期预警
+    if tool_name in TOOL_COMPONENT_MAP:
+        logger.warning(
+            "TOOL_COMPONENT_MAP 注册了 %s 但 _build_component_props 无对应分支", tool_name,
+        )
+    return None
+
+
 def _react_chat_native(memory: Memory, user_input: str) -> str:
     """[chat 模式 + native function calling] 同步 ReAct 循环,CLI 用。
 
@@ -699,9 +733,33 @@ async def _stream_react_rounds(
                 return
 
             # 非 HITL:MCP 工具,正常执行
+            component_type = TOOL_COMPONENT_MAP.get(tc["name"])
+            if component_type:
+                yield ("component_loading", {
+                    "component_type": component_type,
+                    "tool_call_id": tc["id"],
+                    "placeholder_text": f"正在执行 {tc['name']}…",
+                })
+
             tool_result = await mcp_web_search.call_tool_async(tc["name"], args)
             logger.info("执行工具调用:%s,结果=%s", tc["name"], tool_result)
             yield ("tool_result", {"name": tc["name"], "result": _truncate_tool_result(tool_result)})
+
+            if component_type:
+                props = _build_component_props(tc["name"], args, tool_result)
+                if props is not None:
+                    yield ("render_component", {
+                        "component_type": component_type,
+                        "tool_call_id": tc["id"],
+                        "props": props,
+                    })
+                else:
+                    yield ("component_error", {
+                        "component_type": component_type,
+                        "tool_call_id": tc["id"],
+                        "error_message": tool_result[:100] if tool_result else "工具执行失败",
+                    })
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc["id"],

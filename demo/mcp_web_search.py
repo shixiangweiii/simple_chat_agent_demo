@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 MCP_ENDPOINT = "https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp"
 
+# call_tool_async 失败时返回值的统一前缀,上层通过此前缀判断"工具是否执行失败"
+ERROR_PREFIX = "工具调用失败"
+
 # 调用前后日志中的参数 / 结果预览长度,server log 中超过即截断
 _PREVIEW_CHARS = 200
 
@@ -142,7 +145,7 @@ async def call_tool_async(name: str, args: dict[str, Any]) -> str:
                 result = await session.call_tool(name, arguments=args)
     except Exception as exc:
         logger.exception("MCP call_tool 异常: name=%s", name)
-        return f"工具调用失败: {exc}"
+        return f"{ERROR_PREFIX}: {exc}"
 
     elapsed_ms = (time.monotonic() - started_at) * 1000
     if getattr(result, "isError", False):
@@ -151,7 +154,7 @@ async def call_tool_async(name: str, args: dict[str, Any]) -> str:
             "MCP call_tool 业务错误: name=%s elapsed=%.0fms text_chars=%d",
             name, elapsed_ms, len(text),
         )
-        return f"工具调用失败: {text}"
+        return f"{ERROR_PREFIX}: {text}"
 
     text = _flatten_call_result(result)
     logger.info(

@@ -408,17 +408,28 @@
   .search-status {
     display: none;
     font-size: 12.5px;
-    color: #555;
-    padding: 6px 10px;
-    background: #f0f7ff;
-    border: 1px solid #d6e7ff;
-    border-radius: 6px;
+    color: #1e40af;
+    padding: 8px 12px;
+    background: linear-gradient(135deg, #eff6ff 0%, #f0f7ff 100%);
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
     margin-bottom: 8px;
     opacity: 1;
     transition: opacity .25s;
+    font-weight: 500;
   }
-  .search-status.visible { display: block; }
+  .search-status.visible { display: flex; align-items: center; gap: 8px; }
+  .search-status.visible::before {
+    content: '';
+    width: 12px; height: 12px;
+    border: 2px solid #93c5fd;
+    border-top-color: #2563eb;
+    border-radius: 50%;
+    animation: comp-spin .8s linear infinite;
+    flex-shrink: 0;
+  }
   .search-status.fading { opacity: 0; }
+  .search-status.fading::before { animation: none; }
   .thinking-placeholder { color: var(--text-muted); }
   .thinking-dots::after {
     display: inline-block;
@@ -718,6 +729,68 @@
     border-radius: 4px;
     overflow-x: auto;
   }
+
+  /* ---------- Static GenUI: Component Cards ---------- */
+  .component-slot { margin-bottom: 8px; }
+  .component-loading {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    background: #f0f7ff;
+    border: 1px solid #d6e7ff;
+    border-radius: 8px;
+    font-size: 12.5px;
+    color: #555;
+    animation: pulse-bg 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse-bg { 0%,100%{opacity:1} 50%{opacity:.6} }
+  .component-loading::before {
+    content: '';
+    width: 14px; height: 14px;
+    border: 2px solid #93c5fd;
+    border-top-color: #2563eb;
+    border-radius: 50%;
+    animation: comp-spin .8s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes comp-spin { to{transform:rotate(360deg)} }
+
+  .search-results-card {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    background: #fff;
+  }
+  .search-results-header {
+    padding: 8px 12px;
+    background: var(--bg-2);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .search-card-body {
+    padding: 10px 14px;
+    font-size: 13px;
+    line-height: 1.7;
+    max-height: 360px;
+    overflow-y: auto;
+  }
+  .search-card-body a { color: var(--primary); }
+  .search-card-body p { margin: 0 0 8px; }
+  .search-card-body ul, .search-card-body ol { padding-left: 1.4em; margin: 0 0 8px; }
+
+  .component-error {
+    padding: 8px 12px;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    font-size: 12.5px;
+    color: #991b1b;
+  }
 </style>
 </head>
 <body>
@@ -841,6 +914,30 @@
   }
   function renderMarkdown(text) {
     return DOMPurify.sanitize(marked.parse(text));
+  }
+
+  // ---------- Static GenUI: Component Renderers ----------
+  const COMPONENT_RENDERERS = {
+    search_results: function (props) {
+      const card = document.createElement('div');
+      card.className = 'search-results-card';
+      const header = document.createElement('div');
+      header.className = 'search-results-header';
+      header.innerHTML = '\u{1F50D} <span>' + escapeHtml(props.query || '') + '</span>';
+      card.appendChild(header);
+      const body = document.createElement('div');
+      body.className = 'search-card-body';
+      body.innerHTML = renderMarkdown(props.markdown || '');
+      card.appendChild(body);
+      return card;
+    },
+  };
+
+  function renderComponentError(msg) {
+    const el = document.createElement('div');
+    el.className = 'component-error';
+    el.textContent = '⚠ ' + (msg || '组件渲染失败');
+    return el;
   }
 
   // ---------- Mermaid 惰性加载 + 渲染 ----------
@@ -1246,6 +1343,7 @@
       answerBuf: '', thinkStartTs: 0, answeringFlipped: false, answerStarted: false,
       searchFadeTimer: 0,
       awaitingUser: false,  // 流以 await_user 收尾时置 true,跳过 done 的"(无内容)"占位
+      componentSlots: new Map(),  // tool_call_id → component-slot DOM 元素
     };
 
     ctx.flipToAnswering = function () {
@@ -1330,6 +1428,39 @@
           ctx.pushTool(`🛠 调用工具: ${ev.data.name} ${JSON.stringify(ev.data.args)}`);
         } else if (ev.event === 'tool_result') {
           ctx.pushTool(`✓ 工具 ${ev.data.name} 已返回结果`);
+        } else if (ev.event === 'component_loading') {
+          const slot = document.createElement('div');
+          slot.className = 'component-slot';
+          slot.dataset.toolCallId = ev.data.tool_call_id;
+          const loading = document.createElement('div');
+          loading.className = 'component-loading';
+          loading.textContent = ev.data.placeholder_text || '加载中…';
+          slot.appendChild(loading);
+          ctx.$toolStrip.parentNode.insertBefore(slot, ctx.$answer);
+          ctx.$toolStrip.hidden = false;
+          ctx.componentSlots.set(ev.data.tool_call_id, slot);
+          scrollToBottom();
+        } else if (ev.event === 'render_component') {
+          const slot = ctx.componentSlots.get(ev.data.tool_call_id);
+          const renderer = COMPONENT_RENDERERS[ev.data.component_type];
+          if (slot && renderer) {
+            slot.innerHTML = '';
+            slot.appendChild(renderer(ev.data.props));
+          } else if (slot) {
+            slot.innerHTML = '';
+            const pre = document.createElement('pre');
+            pre.style.cssText = 'font-size:11px;overflow:auto;padding:8px;background:var(--bg-2);border-radius:6px';
+            pre.textContent = JSON.stringify(ev.data.props, null, 2);
+            slot.appendChild(pre);
+          }
+          scrollToBottom();
+        } else if (ev.event === 'component_error') {
+          const slot = ctx.componentSlots.get(ev.data.tool_call_id);
+          if (slot) {
+            slot.innerHTML = '';
+            slot.appendChild(renderComponentError(ev.data.error_message));
+          }
+          scrollToBottom();
         } else if (ev.event === 'search_status') {
           ctx.showSearchStatus(ev.data && ev.data.phase);
         } else if (ev.event === 'await_user') {
@@ -1341,6 +1472,13 @@
         } else if (ev.event === 'error') {
           ctx.flipToAnswering();
           ctx.clearSearchStatus();
+          // 清扫未 resolve 的 component-loading slot
+          for (const [, slot] of ctx.componentSlots) {
+            if (slot.querySelector('.component-loading')) {
+              slot.innerHTML = '';
+              slot.appendChild(renderComponentError('发生错误，组件未完成渲染'));
+            }
+          }
           const msg = (ev.data && ev.data.message) || '未知错误';
           if (!ctx.answerStarted) {
             ctx.answerStarted = true;
@@ -1352,6 +1490,13 @@
           scrollToBottom();
         } else if (ev.event === 'done') {
           ctx.clearSearchStatus();
+          // 清扫未 resolve 的 component-loading slot(流中断 / 意外结束时防止永久转圈)
+          for (const [, slot] of ctx.componentSlots) {
+            if (slot.querySelector('.component-loading')) {
+              slot.innerHTML = '';
+              slot.appendChild(renderComponentError('流已结束，组件未完成渲染'));
+            }
+          }
           if (ctx.awaitingUser) {
             // HITL 中断态:答复区若为空,不需要"(无内容)"占位 —— 答复在 HITL bubble 之后才会有
             if (!ctx.answerStarted) {

@@ -180,6 +180,9 @@ All payloads are JSON.
 | `await_user` | `{tool_call_id, name, args, kind: "input"\|"approval"}` | HITL 中断 —— 模型调了 `LOCAL_TOOLS` 中的工具,业务层把状态写入 `_PENDING`,前端按 `kind` 渲染 bubble(input = textarea+提交;approval = 同意/拒绝按钮)。**仅 `chat` 模式 + HITL 工具(`ask_user` / `execute_shell_command`)触发**;紧随其后一定是 `done` 关流,等用户操作触发 `POST /api/resume` 启新流。 |
 | `done` | `{}` | Normal end of stream. HITL 中断也会发(关流让前端不再 read)。 |
 | `error` | `{message}` | LLM / tool / parsing error — terminal. |
+| `component_loading` | `{component_type, tool_call_id, placeholder_text}` | 工具开始执行,前端占位渲染 loading 态。**仅 `chat` 模式 + `TOOL_COMPONENT_MAP` 注册的工具触发。** |
+| `render_component` | `{component_type, tool_call_id, props}` | 工具成功,前端按 `component_type` 查 `COMPONENT_RENDERERS` 渲染卡片,替换同 `tool_call_id` 的 loading 占位。`tool_result` 仍并行发,供 debug。 |
+| `component_error` | `{component_type, tool_call_id, error_message}` | 工具失败或 props 构建失败,卡片渲染错误态替换 loading 占位。 |
 
 ### Non-goals (don't "fix" these)
 
@@ -196,6 +199,12 @@ All payloads are JSON.
   - 如果是非 MCP 的 native 工具(本地 Python 函数 / 第三方 HTTP API),把 OpenAI tools 格式 spec 加进 `_build_native_tools[_async]` 返回值(目前 MCP 工具 + `LOCAL_TOOLS.values()` 合并),并在 `_react_chat_native` / `_stream_react_rounds` 的 tool 派发表上加一条 `name → executor` 分支(目前非 HITL 的 tool_calls 都路由到 `mcp_web_search.call_tool_*`,引入第二种 executor 时这里需要改成按 name 派发)。
   - **HITL 工具(本地伪工具,前端交互)**:在 `LOCAL_TOOLS` 加 OpenAI tools 格式 spec,在 `_LOCAL_TOOL_KIND` 标 `"input"` 或 `"approval"`,在 `_resume_inner` 加一条按 name 构造 tool result 的分支(如何把用户的 `decision` + `answer` 翻译成给模型看的文本)。如果是 approval 类工具且需要真执行(不像 demo 的 shell stub),在 `approve` 分支里加执行 + 把结果文本作为 tool result;reject 分支保持把拒绝理由原样喂回。前端 `addHitlBubble` 已按 `kind` 分支(input → 输入框,approval → 同意/拒绝按钮)统一渲染,新加 HITL 工具无需改前端 —— 只要复用现有两种 kind。如果需要第三种交互形态(如多选 / 拖拽),才需要前端配合。CLI 短路逻辑(`_react_chat_native` 中的 `if tc["name"] in LOCAL_TOOLS`)自动覆盖新加的 HITL 工具,无需重复。
   - **不**把 chat 模式 native tools 接入 `llm()` / `llm_stream()` 老分发器 —— 接口签名(`messages: list[dict]` vs `prompt: str`)不兼容,会破坏 responses 模式。
+- **让新工具结果卡片化(Static GenUI,仅 `chat` 模式生效)**:
+  1. 在 `chat_core.TOOL_COMPONENT_MAP` 加 `"tool_name": "component_type"` 映射
+  2. 在 `chat_core._build_component_props` 加 `if tool_name == "xxx":` 分支,从 args + result_text 构建 props dict
+  3. 在 `index.html` 的 `COMPONENT_RENDERERS` 加同 component_type 的渲染函数
+  4. 测试:发请求触发该工具,前端应显示 loading → 卡片(或 error)
+  5. 注意:`responses` 模式的内置 web_search 是不透明的(无 `tool_call_id`),卡片事件不会触发——该模式仅有 `search_status` banner
 - **ReAct max iterations**: `MAX_ROUNDS = 5` in `chat_core.py` applies to both CLI and Web,**两条路径(text-protocol 与 native function-calling)共用同一上限**。Bump if you need longer tool chains.
 - **Adding a tool that returns large text**: respect the `TOOL_RESULT_PREVIEW_CHARS` truncation (defined in `chat_core.py`) in the SSE `tool_result` event(`_truncate_tool_result` 在 chat-native 路径用,文本协议路径里 `stream_agent_response` 直接 inline 截断),或 refactor the event contract to carry metadata-only with a separate streaming channel。注意:**喂回模型的 messages 中 `role=tool` 的 content 是 full text**,前端 SSE 才截断 —— 模型需要看完整结果,UI 只需要预览。
 - **Frontend XSS surface**: LLM-produced markdown is rendered via `DOMPurify.sanitize(marked.parse(...))` (the `renderMarkdown` helper); user-authored content is rendered via `textContent` only (no markdown parse). The chat view, anchor panel, and archive-preview modal all follow this split. Don't bypass DOMPurify when adding new render paths, and don't promote user input to markdown.
