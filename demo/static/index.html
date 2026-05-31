@@ -348,6 +348,75 @@
   .hitl-reject { background: var(--danger); color: #fff; }
   .hitl-reject:hover:not(:disabled) { background: #b91c1c; }
   .hitl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .plan-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .plan-title {
+    font-weight: 650;
+    font-size: 14px;
+  }
+  .plan-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+  .plan-step {
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+    padding: 7px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #fff;
+  }
+  .plan-step.running { border-color: var(--primary); background: #eef6ff; }
+  .plan-step.done { opacity: 0.72; }
+  .plan-step.error { border-color: #fecaca; background: #fff1f2; }
+  .plan-step.skipped { opacity: 0.55; }
+  .plan-step-title {
+    min-width: 0;
+    border: 1px solid transparent;
+    background: transparent;
+    font: inherit;
+    color: var(--text);
+  }
+  .plan-step-title:not(:disabled) {
+    border-color: var(--border);
+    border-radius: 6px;
+    padding: 5px 6px;
+    background: #fff;
+  }
+  .plan-step-actions {
+    display: flex;
+    gap: 4px;
+  }
+  .plan-mini-btn {
+    border: 1px solid var(--border);
+    background: #fff;
+    border-radius: 6px;
+    padding: 3px 6px;
+    cursor: pointer;
+  }
+  .plan-mini-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .plan-add-row {
+    display: flex;
+    gap: 6px;
+  }
+  .plan-add-input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 7px 9px;
+    font: inherit;
+  }
+  .plan-error {
+    color: var(--danger);
+    font-size: 12.5px;
+  }
   .msg.hitl.resolved {
     background: #f5f5f4;
     border-color: #e7e5e4;
@@ -430,6 +499,41 @@
   }
   .search-status.fading { opacity: 0; }
   .search-status.fading::before { animation: none; }
+  .confidence-panel {
+    margin-top: 10px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #fff;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12.5px;
+  }
+  .confidence-panel[hidden] { display: none; }
+  .confidence-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .confidence-badge {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-weight: 650;
+    border: 1px solid transparent;
+  }
+  .confidence-badge.high { background: #ecfdf5; color: #166534; border-color: #bbf7d0; }
+  .confidence-badge.medium { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+  .confidence-badge.low { background: #fff1f2; color: #be123c; border-color: #fecdd3; }
+  .confidence-reason { color: var(--text-muted); }
+  .confidence-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
   .thinking-placeholder { color: var(--text-muted); }
   .thinking-dots::after {
     display: inline-block;
@@ -758,7 +862,7 @@
 
   .search-results-card {
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: 8px;
     overflow: hidden;
     background: #fff;
   }
@@ -782,6 +886,46 @@
   .search-card-body a { color: var(--primary); }
   .search-card-body p { margin: 0 0 8px; }
   .search-card-body ul, .search-card-body ol { padding-left: 1.4em; margin: 0 0 8px; }
+  .search-result-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .search-result-item {
+    padding: 9px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: #fff;
+  }
+  .search-result-title {
+    display: inline-flex;
+    max-width: 100%;
+    font-weight: 600;
+    line-height: 1.45;
+    text-decoration: none;
+    overflow-wrap: anywhere;
+  }
+  .search-result-title:hover { text-decoration: underline; }
+  .search-result-snippet {
+    margin-top: 5px;
+    color: var(--text);
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+  }
+  .search-result-source {
+    display: inline-flex;
+    margin-top: 7px;
+    max-width: 100%;
+    padding: 2px 6px;
+    border-radius: 999px;
+    background: var(--bg-2);
+    color: var(--text-muted);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+  }
+  .search-fallback {
+    overflow-wrap: anywhere;
+  }
 
   .component-error {
     padding: 8px 12px;
@@ -790,6 +934,97 @@
     border-radius: 8px;
     font-size: 12.5px;
     color: #991b1b;
+  }
+
+  /* ---------- Declarative GenUI: Phase 3a ---------- */
+  .ui-surface {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #fff;
+    margin-bottom: 10px;
+    overflow: hidden;
+  }
+  .ui-surface-empty,
+  .ui-node-error,
+  .ui-table-empty {
+    padding: 10px 12px;
+    color: var(--text-muted);
+    font-size: 12.5px;
+  }
+  .ui-card {
+    padding: 12px;
+  }
+  .ui-card-title {
+    font-weight: 650;
+    margin-bottom: 10px;
+  }
+  .ui-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: stretch;
+  }
+  .ui-column {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .ui-text {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .ui-text-h1 { font-size: 20px; font-weight: 700; line-height: 1.35; }
+  .ui-text-h2 { font-size: 16px; font-weight: 650; line-height: 1.4; }
+  .ui-text-body { font-size: 13.5px; line-height: 1.65; }
+  .ui-text-caption { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+  .ui-text-code {
+    display: inline-block;
+    padding: 2px 5px;
+    border-radius: 4px;
+    background: var(--code-bg);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  .ui-table-wrap {
+    width: 100%;
+    overflow-x: auto;
+  }
+  .ui-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .ui-table th,
+  .ui-table td {
+    border: 1px solid var(--border);
+    padding: 7px 9px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .ui-table th {
+    background: var(--bg-2);
+    font-weight: 650;
+  }
+  .ui-button {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    background: #fff;
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .ui-button.primary {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+  }
+  .ui-button.secondary {
+    background: var(--bg-2);
+  }
+  .ui-button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 
   /* Phase 2: 上下文感知 UI hint */
@@ -935,11 +1170,57 @@
       card.className = 'search-results-card';
       const header = document.createElement('div');
       header.className = 'search-results-header';
-      header.innerHTML = '\u{1F50D} <span>' + escapeHtml(props.query || '') + '</span>';
+      header.innerHTML = '\u{1F50D} <span>' + escapeHtml(props.query || '搜索结果') + '</span>';
       card.appendChild(header);
       const body = document.createElement('div');
       body.className = 'search-card-body';
-      body.innerHTML = renderMarkdown(props.markdown || '');
+      const results = Array.isArray(props.results) ? props.results : [];
+      if (results.length > 0) {
+        const list = document.createElement('div');
+        list.className = 'search-result-list';
+        for (const result of results) {
+          const item = document.createElement('div');
+          item.className = 'search-result-item';
+          const url = result && result.url ? String(result.url) : '';
+          let parsedUrl = null;
+          try {
+            parsedUrl = new URL(url);
+          } catch (_) {
+            parsedUrl = null;
+          }
+          const safeUrl = parsedUrl && ['http:', 'https:'].includes(parsedUrl.protocol) ? parsedUrl.href : '';
+          const titleEl = safeUrl ? document.createElement('a') : document.createElement('span');
+          titleEl.className = 'search-result-title';
+          titleEl.textContent = (result && result.title) || safeUrl || '未命名结果';
+          if (safeUrl) {
+            titleEl.href = safeUrl;
+            titleEl.target = '_blank';
+            titleEl.rel = 'noopener noreferrer';
+          }
+          item.appendChild(titleEl);
+
+          if (result && result.snippet) {
+            const snippet = document.createElement('div');
+            snippet.className = 'search-result-snippet';
+            snippet.textContent = String(result.snippet);
+            item.appendChild(snippet);
+          }
+
+          if (parsedUrl && parsedUrl.hostname) {
+            const source = document.createElement('span');
+            source.className = 'search-result-source';
+            source.textContent = parsedUrl.hostname.replace(/^www\./, '');
+            item.appendChild(source);
+          }
+          list.appendChild(item);
+        }
+        body.appendChild(list);
+      } else {
+        const fallback = document.createElement('div');
+        fallback.className = 'search-fallback';
+        fallback.innerHTML = renderMarkdown(props.raw_markdown || '');
+        body.appendChild(fallback);
+      }
       card.appendChild(body);
       return card;
     },
@@ -951,6 +1232,262 @@
     el.textContent = '⚠ ' + (msg || '组件渲染失败');
     return el;
   }
+
+  // ---------- Declarative GenUI: Phase 3 ----------
+  function jsonPointerGet(data, path) {
+    if (!path || path === '/') return data;
+    if (typeof path !== 'string' || !path.startsWith('/')) return undefined;
+    let cur = data;
+    for (const part of path.slice(1).split('/')) {
+      const key = part.replace(/~1/g, '/').replace(/~0/g, '~');
+      if (cur == null || typeof cur !== 'object') return undefined;
+      cur = cur[key];
+    }
+    return cur;
+  }
+
+  function jsonPointerSet(data, path, value) {
+    if (!path || path === '/') return value && typeof value === 'object' ? value : {};
+    if (typeof path !== 'string' || !path.startsWith('/')) return data;
+    const parts = path.slice(1).split('/').map(part => part.replace(/~1/g, '/').replace(/~0/g, '~'));
+    let cur = data;
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const key = parts[i];
+      if (Array.isArray(cur)) {
+        const idx = Number(key);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) return data;
+        cur = cur[idx];
+      } else if (cur && typeof cur === 'object' && key in cur) {
+        cur = cur[key];
+      } else {
+        return data;
+      }
+    }
+    const last = parts[parts.length - 1];
+    if (Array.isArray(cur)) {
+      const idx = Number(last);
+      if (Number.isInteger(idx) && idx >= 0 && idx < cur.length) cur[idx] = value;
+    } else if (cur && typeof cur === 'object') {
+      cur[last] = value;
+    }
+    return data;
+  }
+
+  function resolveUiValue(value, data) {
+    if (value && typeof value === 'object' && typeof value.path === 'string') {
+      const resolved = jsonPointerGet(data, value.path);
+      return resolved == null ? '' : resolved;
+    }
+    return value == null ? '' : value;
+  }
+
+  function uiNodeError(message) {
+    const el = document.createElement('div');
+    el.className = 'ui-node-error';
+    el.textContent = message;
+    return el;
+  }
+
+  const UI_SURFACE_OWNERS = new Map();
+
+  class DeclarativeRenderer {
+    constructor(container) {
+      this.container = container;
+      this.surfaces = new Map();
+      this.maxDepth = 12;
+    }
+
+    handleEvent(eventName, payload) {
+      const surfaceId = payload && payload.surface_id;
+      if (
+        surfaceId &&
+        !this.surfaces.has(surfaceId) &&
+        (eventName === 'ui_surface_update' || eventName === 'ui_data_update')
+      ) {
+        const owner = UI_SURFACE_OWNERS.get(surfaceId);
+        if (owner && owner !== this) {
+          owner.handleEvent(eventName, payload);
+          return;
+        }
+      }
+      if (eventName === 'ui_surface_create') {
+        this._createSurface(surfaceId);
+      } else if (eventName === 'ui_surface_update') {
+        this._updateComponents(surfaceId, (payload && payload.components) || []);
+      } else if (eventName === 'ui_data_update') {
+        this._updateData(surfaceId, payload && payload.path, payload && payload.value);
+      }
+    }
+
+    _createSurface(surfaceId) {
+      if (!surfaceId) return;
+      let surface = this.surfaces.get(surfaceId);
+      if (!surface) {
+        const dom = document.createElement('div');
+        dom.className = 'ui-surface';
+        dom.dataset.surfaceId = surfaceId;
+        const empty = document.createElement('div');
+        empty.className = 'ui-surface-empty';
+        empty.textContent = '正在渲染界面...';
+        dom.appendChild(empty);
+        this.container.appendChild(dom);
+        surface = { surfaceId, components: new Map(), data: {}, dom };
+        this.surfaces.set(surfaceId, surface);
+        UI_SURFACE_OWNERS.set(surfaceId, this);
+      }
+      this._renderSurface(surface);
+    }
+
+    _updateComponents(surfaceId, components) {
+      if (!surfaceId) return;
+      this._createSurface(surfaceId);
+      const surface = this.surfaces.get(surfaceId);
+      surface.components = new Map();
+      if (Array.isArray(components)) {
+        for (const comp of components) {
+          if (comp && typeof comp.id === 'string') {
+            surface.components.set(comp.id, comp);
+          }
+        }
+      }
+      this._renderSurface(surface);
+    }
+
+    _updateData(surfaceId, path, value) {
+      if (!surfaceId) return;
+      this._createSurface(surfaceId);
+      const surface = this.surfaces.get(surfaceId);
+      surface.data = jsonPointerSet(surface.data || {}, path || '/', value);
+      this._renderSurface(surface);
+    }
+
+    _renderSurface(surface) {
+      surface.dom.innerHTML = '';
+      const root = surface.components.get('root');
+      if (!root) {
+        const empty = document.createElement('div');
+        empty.className = 'ui-surface-empty';
+        empty.textContent = '等待 UI 组件...';
+        surface.dom.appendChild(empty);
+        return;
+      }
+      surface.dom.appendChild(this._renderNode(root, surface, 0, new Set()));
+    }
+
+    _renderNode(comp, surface, depth, seen) {
+      if (!comp || typeof comp !== 'object') return uiNodeError('无效组件');
+      if (depth > this.maxDepth) return uiNodeError('组件嵌套过深');
+      if (seen.has(comp.id)) return uiNodeError(`组件循环引用: ${comp.id}`);
+      const nextSeen = new Set(seen);
+      nextSeen.add(comp.id);
+      const renderer = UI_NODE_RENDERERS[comp.type];
+      if (!renderer) return uiNodeError(`未知组件: ${comp.type}`);
+      return renderer(comp, surface, childId => {
+        const child = surface.components.get(childId);
+        if (!child) return uiNodeError(`缺失子组件: ${childId}`);
+        return this._renderNode(child, surface, depth + 1, nextSeen);
+      });
+    }
+  }
+
+  const UI_NODE_RENDERERS = {
+    text(comp, surface) {
+      const variant = ['h1', 'h2', 'body', 'caption', 'code'].includes(comp.variant) ? comp.variant : 'body';
+      const tag = variant === 'h1' ? 'h3' : variant === 'h2' ? 'h4' : variant === 'code' ? 'code' : 'p';
+      const el = document.createElement(tag);
+      el.className = `ui-text ui-text-${variant}`;
+      let value = '';
+      if (comp.text !== undefined) {
+        value = comp.text;
+      } else if (typeof comp.path === 'string') {
+        value = { path: comp.path };
+      }
+      el.textContent = String(resolveUiValue(value, surface.data));
+      return el;
+    },
+    card(comp, surface, renderChild) {
+      const el = document.createElement('div');
+      el.className = 'ui-card';
+      if (comp.title) {
+        const title = document.createElement('div');
+        title.className = 'ui-card-title';
+        title.textContent = String(comp.title);
+        el.appendChild(title);
+      }
+      for (const childId of Array.isArray(comp.children) ? comp.children : []) {
+        el.appendChild(renderChild(childId));
+      }
+      return el;
+    },
+    row(comp, surface, renderChild) {
+      const el = document.createElement('div');
+      el.className = 'ui-row';
+      for (const childId of Array.isArray(comp.children) ? comp.children : []) {
+        el.appendChild(renderChild(childId));
+      }
+      return el;
+    },
+    column(comp, surface, renderChild) {
+      const el = document.createElement('div');
+      el.className = 'ui-column';
+      for (const childId of Array.isArray(comp.children) ? comp.children : []) {
+        el.appendChild(renderChild(childId));
+      }
+      return el;
+    },
+    table(comp, surface) {
+      const rows = jsonPointerGet(surface.data, comp.rows_path || '/');
+      const columns = Array.isArray(comp.columns) ? comp.columns : [];
+      if (!Array.isArray(rows) || rows.length === 0 || columns.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'ui-table-empty';
+        empty.textContent = '暂无表格数据';
+        return empty;
+      }
+      const wrap = document.createElement('div');
+      wrap.className = 'ui-table-wrap';
+      const table = document.createElement('table');
+      table.className = 'ui-table';
+      const thead = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      for (const col of columns) {
+        const th = document.createElement('th');
+        th.textContent = String(col.label || col.key || '');
+        headRow.appendChild(th);
+      }
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+      const tbody = document.createElement('tbody');
+      for (const row of rows) {
+        const tr = document.createElement('tr');
+        for (const col of columns) {
+          const td = document.createElement('td');
+          td.textContent = String(row && col.key ? row[col.key] ?? '' : '');
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      wrap.appendChild(table);
+      return wrap;
+    },
+    button(comp, surface) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `ui-button ${comp.variant === 'primary' ? 'primary' : comp.variant === 'secondary' ? 'secondary' : ''}`;
+      btn.textContent = String(comp.label || '按钮');
+      const action = comp.action && typeof comp.action === 'object' ? comp.action : null;
+      const eventName = action && typeof action.event_name === 'string' ? action.event_name : '';
+      if (eventName) {
+        btn.title = '执行 UI action';
+        btn.addEventListener('click', () => sendUiAction(surface.surfaceId, comp, btn));
+      } else {
+        btn.title = '此按钮没有可执行 action';
+        btn.addEventListener('click', () => showToast('此按钮没有可执行 action', true));
+      }
+      return btn;
+    },
+  };
 
   // ---------- Mermaid 惰性加载 + 渲染 ----------
   let mermaidPromise = null;
@@ -1142,6 +1679,13 @@
     $input.disabled = streaming;
     $send.textContent = streaming ? '生成中...' : '发送';
   }
+  function canStartStream(label = '当前') {
+    if ($send.disabled) {
+      showToast(`${label}已有流式响应进行中，请稍候`, true);
+      return false;
+    }
+    return true;
+  }
   function parseSSEBlock(block) {
     const ev = { event: 'message', data: null };
     for (const line of block.split('\n')) {
@@ -1164,6 +1708,13 @@
   }
 
   // ---------- session 列表/历史/切换/归档 ----------
+  function clearRuntimeUiState() {
+    if (currentHitlBubble) markHitlResolved(currentHitlBubble, '已离开会话');
+    currentHitlBubble = null;
+    PLAN_CARDS.clear();
+    UI_SURFACE_OWNERS.clear();
+  }
+
   async function loadSessions() {
     try {
       const resp = await fetch('/api/sessions');
@@ -1215,11 +1766,14 @@
   }
 
   async function loadHistory(sid) {
+    clearUiHint();
+    clearRuntimeUiState();
     try {
       const resp = await fetch('/api/history?session_id=' + encodeURIComponent(sid));
       if (resp.status === 404) {
         // 此 session 还未归档,正常空对话框
         showEmptyPlaceholder();
+        await loadRuntimeState(sid);
         return;
       }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -1227,6 +1781,7 @@
       const messages = (data && data.messages) || [];
       if (messages.length === 0) {
         showEmptyPlaceholder();
+        await loadRuntimeState(sid);
         return;
       }
       $messages.innerHTML = '';
@@ -1240,13 +1795,68 @@
       }
       scrollToBottom(true);
       renderMermaidIn($messages);  // 历史一次性回灌后,把所有 AI 消息里的 mermaid 块异步换成 SVG
+      await loadRuntimeState(sid);
     } catch (e) {
       showToast('加载历史失败: ' + e.message, true);
     }
   }
 
+  async function loadRuntimeState(sid) {
+    if (!sid) return;
+    try {
+      const resp = await fetch('/api/runtime_state?session_id=' + encodeURIComponent(sid));
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const state = await resp.json();
+      if (!state || state.session_id !== sid) return;
+
+      const surfaces = Array.isArray(state.surfaces) ? state.surfaces : [];
+      if (surfaces.length > 0) {
+        const ctx = createAiStreamContext();
+        ctx.flipToAnswering();
+        ctx.answerStarted = true;
+        ctx.$answer.innerHTML = '<span class="thinking-placeholder">已恢复可交互界面</span>';
+        for (const surface of surfaces) {
+          const surfaceId = surface && surface.surface_id;
+          if (!surfaceId) continue;
+          ctx.uiRenderer.handleEvent('ui_surface_create', { surface_id: surfaceId });
+          ctx.uiRenderer.handleEvent('ui_surface_update', {
+            surface_id: surfaceId,
+            components: Array.isArray(surface.components) ? surface.components : [],
+          });
+          ctx.uiRenderer.handleEvent('ui_data_update', {
+            surface_id: surfaceId,
+            path: '/',
+            value: surface.data && typeof surface.data === 'object' ? surface.data : {},
+          });
+        }
+      }
+
+      const plans = Array.isArray(state.plans) ? state.plans : [];
+      for (const plan of plans) {
+        upsertPlanCard(plan);
+        if (plan && plan.decision_required) {
+          addPlanDecisionBubble({
+            kind: 'plan_decision',
+            plan_id: plan.plan_id,
+            step_id: plan.step_id,
+            title: plan.title,
+            steps: plan.steps,
+            error_message: plan.error_message || '步骤执行失败',
+          });
+        }
+      }
+
+      if (state.pending) {
+        addHitlBubble(state.pending);
+      }
+    } catch (e) {
+      showToast('恢复运行态失败: ' + e.message, true);
+    }
+  }
+
   async function switchTo(sid) {
     if (sid === SESSION_ID) return;
+    clearUiHint();
     // 离开当前会话,把未决 HITL bubble 灰化(后端 _PENDING 项保留,下次同 session 的
     // /api/chat 会自动清理;此处只切断前端交互入口)
     if (currentHitlBubble) markHitlResolved(currentHitlBubble, '已离开会话');
@@ -1279,6 +1889,8 @@
   }
 
   async function newSession() {
+    clearUiHint();
+    clearRuntimeUiState();
     // 离开当前会话:未决 HITL bubble 灰化
     if (currentHitlBubble) markHitlResolved(currentHitlBubble, '已新建会话');
     // 静默归档当前(空 session 服务端会跳过)
@@ -1319,12 +1931,13 @@
   // ---------- chat ----------
   // 当前未决 HITL bubble 引用(切换会话/新建会话时灰化)
   let currentHitlBubble = null;
+  const PLAN_CARDS = new Map();
 
   function markHitlResolved(div, resolvedNote = '') {
     if (!div) return;
     div.classList.add('resolved');
     // 禁用所有交互
-    div.querySelectorAll('button, textarea, .hitl-opt').forEach((el) => {
+    div.querySelectorAll('button, input, textarea, .hitl-opt').forEach((el) => {
       el.disabled = true;
       if (el.classList && el.classList.contains('hitl-opt')) {
         el.style.pointerEvents = 'none';
@@ -1346,17 +1959,27 @@
     const $toolStrip = aiDiv.querySelector('.tool-strip');
     const $answer = aiDiv.querySelector('.answer-body');
     const $searchStatus = aiDiv.querySelector('.search-status');
+    const confidencePanel = document.createElement('div');
+    confidencePanel.className = 'confidence-panel';
+    confidencePanel.hidden = true;
+    $answer.insertAdjacentElement('afterend', confidencePanel);
     const thinkTextNode = document.createTextNode('');
     $thinkBody.appendChild(thinkTextNode);
 
     const ctx = {
       aiDiv, $think, $thinkBody, $thinkSummary, $toolStrip, $answer, $searchStatus,
+      confidencePanel,
       thinkTextNode,
       answerBuf: '', thinkStartTs: 0, answeringFlipped: false, answerStarted: false,
       searchFadeTimer: 0,
       awaitingUser: false,  // 流以 await_user 收尾时置 true,跳过 done 的"(无内容)"占位
       componentSlots: new Map(),  // tool_call_id → component-slot DOM 元素
+      uiRenderer: null,
     };
+    const uiMount = document.createElement('div');
+    uiMount.className = 'ui-surface-mount';
+    ctx.$toolStrip.parentNode.insertBefore(uiMount, ctx.$answer);
+    ctx.uiRenderer = new DeclarativeRenderer(uiMount);
 
     ctx.flipToAnswering = function () {
       if (ctx.answeringFlipped) return;
@@ -1405,7 +2028,82 @@
       if (ctx.searchFadeTimer) { clearTimeout(ctx.searchFadeTimer); ctx.searchFadeTimer = 0; }
       ctx.$searchStatus.classList.remove('visible', 'fading');
     };
+    ctx.showConfidence = function (data) {
+      renderConfidenceSignal(ctx.confidencePanel, data || {});
+    };
     return ctx;
+  }
+
+  function confidenceLabel(level) {
+    return {
+      high: '高置信度',
+      medium: '中置信度',
+      low: '低置信度草稿',
+    }[level] || '置信度';
+  }
+
+  function renderConfidenceSignal(panel, data) {
+    if (!panel) return;
+    panel.innerHTML = '';
+    panel.hidden = false;
+    const level = ['high', 'medium', 'low'].includes(data.level) ? data.level : 'medium';
+    const score = typeof data.score === 'number' ? data.score : Number(data.score || 0);
+
+    const row = document.createElement('div');
+    row.className = 'confidence-row';
+    const badge = document.createElement('span');
+    badge.className = `confidence-badge ${level}`;
+    badge.textContent = `${confidenceLabel(level)} ${Math.round(Math.max(0, Math.min(1, score)) * 100)}%`;
+    row.appendChild(badge);
+    const reason = document.createElement('span');
+    reason.className = 'confidence-reason';
+    reason.textContent = data.reason || '';
+    row.appendChild(reason);
+    panel.appendChild(row);
+
+    if (data.draft && data.draft_id) {
+      const actions = document.createElement('div');
+      actions.className = 'confidence-actions';
+      const discard = document.createElement('button');
+      discard.type = 'button';
+      discard.className = 'hitl-btn hitl-reject';
+      discard.textContent = '丢弃';
+      const accept = document.createElement('button');
+      accept.type = 'button';
+      accept.className = 'hitl-btn hitl-submit';
+      accept.textContent = '采纳';
+      const decide = (decision) => {
+        sendConfidenceDecision(data.draft_id, decision, panel);
+      };
+      discard.addEventListener('click', () => decide('discard'));
+      accept.addEventListener('click', () => decide('accept'));
+      actions.appendChild(discard);
+      actions.appendChild(accept);
+      panel.appendChild(actions);
+    }
+    scrollToBottom();
+  }
+
+  async function sendConfidenceDecision(draftId, decision, panel) {
+    if (!SESSION_ID || !draftId) return;
+    const buttons = panel ? panel.querySelectorAll('button') : [];
+    buttons.forEach(btn => { btn.disabled = true; });
+    try {
+      const resp = await fetch('/api/confidence_decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID, draft_id: draftId, decision }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const status = document.createElement('div');
+      status.className = 'confidence-reason';
+      status.textContent = decision === 'accept' ? '已采纳到记忆' : '已丢弃,不会写入记忆';
+      if (panel) panel.appendChild(status);
+      showToast(decision === 'accept' ? '已采纳草稿' : '已丢弃草稿');
+    } catch (e) {
+      buttons.forEach(btn => { btn.disabled = false; });
+      showToast('处理置信度草稿失败: ' + (e.message || String(e)), true);
+    }
   }
 
   // SSE 流消费循环 —— 共用 dispatch
@@ -1475,8 +2173,23 @@
           scrollToBottom();
         } else if (ev.event === 'search_status') {
           ctx.showSearchStatus(ev.data && ev.data.phase);
+        } else if (ev.event === 'confidence_signal') {
+          ctx.showConfidence(ev.data || {});
         } else if (ev.event === 'ui_hint') {
           applyUiHint(ev.data || {});
+        } else if (
+          ev.event === 'ui_surface_create' ||
+          ev.event === 'ui_surface_update' ||
+          ev.event === 'ui_data_update'
+        ) {
+          ctx.uiRenderer.handleEvent(ev.event, ev.data || {});
+          scrollToBottom();
+        } else if (ev.event === 'activity_snapshot') {
+          upsertPlanCard(ev.data || {});
+          scrollToBottom();
+        } else if (ev.event === 'activity_delta') {
+          applyActivityDelta(ev.data || {});
+          scrollToBottom();
         } else if (ev.event === 'await_user') {
           // HITL 中断:渲染 HITL bubble,本流即将结束(后端会紧接着发 done)
           ctx.flipToAnswering();
@@ -1534,14 +2247,19 @@
     };
   }
 
+  function clearUiHint() {
+    const $el = document.getElementById('messages');
+    if (!$el) return;
+    $el.classList.remove('compact-mode');
+    const oldHint = $el.querySelector('.focus-hint');
+    if (oldHint) oldHint.remove();
+  }
+
   function applyUiHint(data) {
     const mode = data && data.mode;
     const $el = document.getElementById('messages');
     if (!$el) return;
-    // 清除之前的 hint 状态
-    $el.classList.remove('compact-mode');
-    const oldHint = $el.querySelector('.focus-hint');
-    if (oldHint) oldHint.remove();
+    clearUiHint();
 
     if (mode === 'compact') {
       $el.classList.add('compact-mode');
@@ -1551,14 +2269,16 @@
       hint.textContent = '针对选中文本回答';
       $el.insertBefore(hint, $el.firstChild);
     }
-    // mode === 'chat' → 仅清除，不做额外操作
+    // unknown/chat → 仅清除，不做额外操作
   }
 
   async function send() {
     const text = $input.value.trim();
-    if (!text || $send.disabled) return;
+    if (!text || !canStartStream('聊天')) return;
     if (!SESSION_ID) { showToast('会话未就绪,请稍候', true); return; }
 
+    const context = collectContext();
+    clearUiHint();
     addMessage('user', escapeHtml(text).replace(/\n/g, '<br>'), text);
     $input.value = '';
     autoResize();
@@ -1569,7 +2289,7 @@
       const resp = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: SESSION_ID, message: text, context: collectContext() }),
+        body: JSON.stringify({ session_id: SESSION_ID, message: text, context }),
       });
       if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
       await consumeStream(resp.body.getReader(), ctx);
@@ -1583,8 +2303,380 @@
     }
   }
 
+  async function sendUiAction(surfaceId, comp, btn) {
+    if (!SESSION_ID) { showToast('会话未就绪,无法执行 action', true); return; }
+    if (!canStartStream('UI action')) return;
+    const action = comp && comp.action && typeof comp.action === 'object' ? comp.action : null;
+    const eventName = action && typeof action.event_name === 'string' ? action.event_name : '';
+    if (!surfaceId || !comp || !comp.id || !eventName) {
+      showToast('UI action 信息不完整', true);
+      return;
+    }
+
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '处理中...';
+    setStreaming(true);
+    const ctx = createAiStreamContext();
+    try {
+      const resp = await fetch('/api/ui_action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: SESSION_ID,
+          surface_id: surfaceId,
+          component_id: comp.id,
+          event_name: eventName,
+        }),
+      });
+      if (!resp.ok || !resp.body) {
+        let detail = `HTTP ${resp.status}`;
+        try { const j = await resp.json(); if (j && j.detail) detail += ` ${j.detail}`; } catch (e) { /* noop */ }
+        throw new Error(detail);
+      }
+      await consumeStream(resp.body.getReader(), ctx);
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = originalText;
+      const msg = e && e.message ? e.message : String(e);
+      ctx.flipToAnswering();
+      ctx.$answer.innerHTML = `<span class="error-text">⚠ UI action 失败: ${escapeHtml(msg)}</span>`;
+      showToast('UI action 失败: ' + msg, true);
+    } finally {
+      setStreaming(false);
+      if (btn.isConnected && btn.disabled) btn.textContent = originalText;
+      $input.focus();
+    }
+  }
+
+  function planStatusIcon(status) {
+    return {
+      pending: '○',
+      running: '●',
+      done: '✓',
+      error: '!',
+      skipped: '↷',
+      waiting: '…',
+    }[status] || '○';
+  }
+
+  function buildPlanStepRow(step, editable) {
+    const row = document.createElement('div');
+    row.className = `plan-step ${step.status || 'pending'}`;
+    row.dataset.stepId = step.id || '';
+
+    const icon = document.createElement('span');
+    icon.className = 'plan-step-icon';
+    icon.textContent = planStatusIcon(step.status);
+    row.appendChild(icon);
+
+    const input = document.createElement('input');
+    input.className = 'plan-step-title';
+    input.value = step.title || '';
+    input.disabled = !editable;
+    input.setAttribute('aria-label', '计划步骤');
+    row.appendChild(input);
+
+    const actions = document.createElement('div');
+    actions.className = 'plan-step-actions';
+    for (const [label, action] of [['↑', 'up'], ['↓', 'down'], ['×', 'delete']]) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'plan-mini-btn';
+      btn.textContent = label;
+      btn.dataset.action = action;
+      btn.disabled = !editable;
+      actions.appendChild(btn);
+    }
+    row.appendChild(actions);
+    return row;
+  }
+
+  function collectPlanSteps(card) {
+    if (!card) return [];
+    return Array.from(card.querySelectorAll('.plan-step')).map((row, idx) => {
+      const input = row.querySelector('.plan-step-title');
+      return {
+        id: row.dataset.stepId || `s${idx + 1}`,
+        title: (input && input.value.trim()) || `步骤 ${idx + 1}`,
+      };
+    }).filter(step => step.title);
+  }
+
+  function attachPlanStepEditing(stepsEl) {
+    stepsEl.addEventListener('click', (e) => {
+      const btn = e.target.closest('.plan-mini-btn');
+      if (!btn) return;
+      const row = btn.closest('.plan-step');
+      if (!row) return;
+      if (btn.dataset.action === 'delete') {
+        row.remove();
+      } else if (btn.dataset.action === 'up' && row.previousElementSibling) {
+        stepsEl.insertBefore(row, row.previousElementSibling);
+      } else if (btn.dataset.action === 'down' && row.nextElementSibling) {
+        stepsEl.insertBefore(row.nextElementSibling, row);
+      }
+    });
+  }
+
+  function buildPlanAddRow(stepsEl) {
+    const addRow = document.createElement('div');
+    addRow.className = 'plan-add-row';
+    const addInput = document.createElement('input');
+    addInput.className = 'plan-add-input';
+    addInput.placeholder = '新增步骤';
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'hitl-btn hitl-submit';
+    addBtn.textContent = '新增';
+    addBtn.addEventListener('click', () => {
+      const title = addInput.value.trim();
+      if (!title) { addInput.focus(); return; }
+      stepsEl.appendChild(buildPlanStepRow({ id: `s${stepsEl.children.length + 1}`, title, status: 'pending' }, true));
+      addInput.value = '';
+    });
+    addRow.appendChild(addInput);
+    addRow.appendChild(addBtn);
+    return addRow;
+  }
+
+  function buildEditablePlanSteps(steps) {
+    const editor = document.createElement('div');
+    editor.className = 'plan-card plan-decision-editor';
+    const stepsEl = document.createElement('div');
+    stepsEl.className = 'plan-steps';
+    for (const step of Array.isArray(steps) ? steps : []) {
+      stepsEl.appendChild(buildPlanStepRow(step, true));
+    }
+    editor.appendChild(stepsEl);
+    attachPlanStepEditing(stepsEl);
+    editor.appendChild(buildPlanAddRow(stepsEl));
+    return editor;
+  }
+
+  function renderPlanCard(card, data, editable) {
+    card.innerHTML = '';
+    card.dataset.planId = data.plan_id || card.dataset.planId || '';
+    card.dataset.editable = editable ? '1' : '0';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'plan-card';
+    const title = document.createElement('div');
+    title.className = 'plan-title';
+    title.textContent = data.title || '执行计划';
+    wrap.appendChild(title);
+
+    const stepsEl = document.createElement('div');
+    stepsEl.className = 'plan-steps';
+    for (const step of Array.isArray(data.steps) ? data.steps : []) {
+      stepsEl.appendChild(buildPlanStepRow(step, editable));
+    }
+    wrap.appendChild(stepsEl);
+
+    if (editable) {
+      attachPlanStepEditing(stepsEl);
+      wrap.appendChild(buildPlanAddRow(stepsEl));
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'hitl-actions';
+    if (editable) {
+      const confirm = document.createElement('button');
+      confirm.type = 'button';
+      confirm.className = 'hitl-btn hitl-submit';
+      confirm.textContent = '确认并执行';
+      confirm.addEventListener('click', () => {
+        if (!canStartStream('计划执行')) return;
+        const steps = collectPlanSteps(card);
+        if (steps.length === 0) { showToast('至少保留一个步骤', true); return; }
+        card.querySelectorAll('button, input').forEach(el => { el.disabled = true; });
+        if (currentHitlBubble === card) currentHitlBubble = null;
+        consumePlanConfirmStream({ plan_id: card.dataset.planId, steps });
+      });
+      actions.appendChild(confirm);
+    } else if (data.continuable) {
+      const cont = document.createElement('button');
+      cont.type = 'button';
+      cont.className = 'hitl-btn hitl-submit';
+      cont.textContent = '继续执行';
+      cont.addEventListener('click', () => {
+        if (!canStartStream('计划继续执行')) return;
+        card.querySelectorAll('button').forEach(el => { el.disabled = true; });
+        consumePlanContinueStream({ plan_id: card.dataset.planId });
+      });
+      actions.appendChild(cont);
+    }
+    wrap.appendChild(actions);
+    card.appendChild(wrap);
+  }
+
+  function upsertPlanCard(data) {
+    if (!data.plan_id) return;
+    const $emptyEl = document.getElementById('empty');
+    if ($emptyEl) $emptyEl.remove();
+    let card = PLAN_CARDS.get(data.plan_id);
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'msg hitl';
+      PLAN_CARDS.set(data.plan_id, card);
+      $messages.appendChild(card);
+    }
+    renderPlanCard(card, data, !!data.editable);
+    if (data.editable) currentHitlBubble = card;
+  }
+
+  function applyActivityDelta(data) {
+    const card = data && data.plan_id ? PLAN_CARDS.get(data.plan_id) : null;
+    if (!card) return;
+    for (const patch of Array.isArray(data.patch) ? data.patch : []) {
+      const m = /^\/steps\/(\d+)\/(status|result_summary|error_message)$/.exec(patch.path || '');
+      if (!m) continue;
+      const idx = Number(m[1]);
+      const field = m[2];
+      const row = card.querySelectorAll('.plan-step')[idx];
+      if (!row) continue;
+      if (field === 'status') {
+        row.className = `plan-step ${patch.value || 'pending'}`;
+        const icon = row.querySelector('.plan-step-icon');
+        if (icon) icon.textContent = planStatusIcon(patch.value);
+      } else if (field === 'error_message' && patch.value) {
+        let err = row.querySelector('.plan-error');
+        if (!err) {
+          err = document.createElement('div');
+          err.className = 'plan-error';
+          row.appendChild(err);
+        }
+        err.textContent = String(patch.value);
+      }
+    }
+  }
+
+  async function consumePlanConfirmStream(body) {
+    if (!SESSION_ID) { showToast('会话未就绪,无法执行计划', true); return; }
+    if (!canStartStream('计划执行')) return;
+    setStreaming(true);
+    const ctx = createAiStreamContext();
+    try {
+      const resp = await fetch('/api/plan_confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID, ...body }),
+      });
+      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
+      await consumeStream(resp.body.getReader(), ctx);
+    } catch (e) {
+      ctx.flipToAnswering();
+      ctx.$answer.innerHTML = `<span class="error-text">⚠ 计划执行失败: ${escapeHtml(e.message || String(e))}</span>`;
+    } finally {
+      setStreaming(false);
+      $input.focus();
+    }
+  }
+
+  async function consumePlanDecisionStream(body) {
+    if (!SESSION_ID) { showToast('会话未就绪,无法继续计划', true); return; }
+    if (!canStartStream('计划恢复')) return;
+    setStreaming(true);
+    const ctx = createAiStreamContext();
+    try {
+      const resp = await fetch('/api/plan_decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID, ...body }),
+      });
+      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
+      await consumeStream(resp.body.getReader(), ctx);
+    } catch (e) {
+      ctx.flipToAnswering();
+      ctx.$answer.innerHTML = `<span class="error-text">⚠ 计划恢复失败: ${escapeHtml(e.message || String(e))}</span>`;
+    } finally {
+      setStreaming(false);
+      $input.focus();
+    }
+  }
+
+  async function consumePlanContinueStream(body) {
+    if (!SESSION_ID) { showToast('会话未就绪,无法继续计划', true); return; }
+    if (!canStartStream('计划继续执行')) return;
+    setStreaming(true);
+    const ctx = createAiStreamContext();
+    try {
+      const resp = await fetch('/api/plan_continue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID, ...body }),
+      });
+      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
+      await consumeStream(resp.body.getReader(), ctx);
+    } catch (e) {
+      ctx.flipToAnswering();
+      ctx.$answer.innerHTML = `<span class="error-text">⚠ 计划继续失败: ${escapeHtml(e.message || String(e))}</span>`;
+    } finally {
+      setStreaming(false);
+      $input.focus();
+    }
+  }
+
+  function addPlanDecisionBubble(payload) {
+    const div = document.createElement('div');
+    div.className = 'msg hitl';
+    const header = document.createElement('div');
+    header.className = 'hitl-header';
+    header.textContent = '计划步骤需要处理';
+    div.appendChild(header);
+
+    const msg = document.createElement('div');
+    msg.className = 'hitl-question';
+    msg.textContent = payload.error_message || '步骤执行失败';
+    div.appendChild(msg);
+
+    const editor = buildEditablePlanSteps(payload.steps || []);
+    div.appendChild(editor);
+
+    const actions = document.createElement('div');
+    actions.className = 'hitl-actions';
+    const makeBtn = (label, decision) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = decision === 'skip' ? 'hitl-btn hitl-reject' : 'hitl-btn hitl-submit';
+      btn.textContent = label;
+      btn.addEventListener('click', () => {
+        if (!canStartStream('计划恢复')) return;
+        markHitlResolved(div, label);
+        consumePlanDecisionStream({
+          plan_id: payload.plan_id,
+          step_id: payload.step_id,
+          decision,
+          steps: decision === 'update' ? collectPlanSteps(editor) : null,
+        });
+      });
+      return btn;
+    };
+    actions.appendChild(makeBtn('跳过', 'skip'));
+    actions.appendChild(makeBtn('重试', 'retry'));
+    actions.appendChild(makeBtn('修改后继续', 'update'));
+    div.appendChild(actions);
+    $messages.appendChild(div);
+    currentHitlBubble = div;
+    scrollToBottom(true);
+  }
+
   // ---------- HITL bubble ----------
   function addHitlBubble(payload) {
+    if (payload.kind === 'plan') {
+      upsertPlanCard({
+        plan_id: payload.plan_id,
+        title: payload.title,
+        steps: payload.steps,
+        editable: true,
+        status: 'pending_confirmation',
+      });
+      return;
+    }
+    if (payload.kind === 'plan_decision') {
+      addPlanDecisionBubble(payload);
+      return;
+    }
     const $emptyEl = document.getElementById('empty');
     if ($emptyEl) $emptyEl.remove();
     const div = document.createElement('div');
@@ -1638,6 +2730,7 @@
       submit.className = 'hitl-btn hitl-submit';
       submit.textContent = '提交答复';
       submit.addEventListener('click', () => {
+        if (!canStartStream('继续对话')) return;
         const answer = textarea.value.trim();
         if (!answer) { textarea.focus(); return; }
         markHitlResolved(div, `已答复: ${answer.slice(0, 40)}${answer.length > 40 ? '…' : ''}`);
@@ -1686,6 +2779,7 @@
       approve.className = 'hitl-btn hitl-approve';
       approve.textContent = '✓ 同意执行';
       approve.addEventListener('click', () => {
+        if (!canStartStream('继续对话')) return;
         markHitlResolved(div, '已同意');
         consumeResumeStream({
           tool_call_id: payload.tool_call_id,
@@ -1698,6 +2792,7 @@
       reject.className = 'hitl-btn hitl-reject';
       reject.textContent = '✗ 拒绝';
       reject.addEventListener('click', () => {
+        if (!canStartStream('继续对话')) return;
         const reason = rejectReason.value.trim() || null;
         markHitlResolved(div, '已拒绝');
         consumeResumeStream({
@@ -1719,6 +2814,7 @@
   // resume 流消费 —— 新建 aiDiv 承接 resume 后续(可能再触发 HITL,可能直接答复)
   async function consumeResumeStream(body) {
     if (!SESSION_ID) { showToast('会话未就绪,无法提交', true); return; }
+    if (!canStartStream('继续对话')) return;
     setStreaming(true);
     const ctx = createAiStreamContext();
     try {
@@ -1769,6 +2865,8 @@
       showToast('重置失败: ' + e.message, true);
     }
     currentHitlBubble = null;  // reset 会 innerHTML='',旧引用作废
+    clearUiHint();
+    clearRuntimeUiState();
     showEmptyPlaceholder('已清空对话。');
     await loadSessions();
   });

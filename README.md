@@ -24,8 +24,21 @@ pip install -r requirements.txt
 
 ```bash
 export DASHSCOPE_API_KEY=sk-xxx        # 必填
-export QWEN_MODEL=qwen-plus            # 可选，默认 qwen-plus
+export QWEN_MODEL=qwen3.7-max          # 可选，默认 qwen3.7-max
+export API_MODE=responses              # 可选，responses(默认) 或 chat
 ```
+
+> Phase 1 Static GenUI 的搜索结果卡片只在 `API_MODE=chat` 下生效：该模式通过 Chat Completions native function calling 调用 DashScope WebSearch MCP 工具，后端能拿到 `tool_call_id` 和完整工具结果并发送 `component_*` SSE 事件。默认 `responses` 模式仍保留内置 `web_search` 的 `search_status` 横幅，不会生成搜索结果卡片。
+
+> Phase 2 上下文感知会在 Web 请求中附带 `viewport_width` / `selected_text` / `session_message_count`。后端据此注入简短自适应 prompt，并仅在需要切换布局时发送 `ui_hint`（如 `focus` / `compact`，payload 含 `reason`）。
+
+> Phase 3 Declarative GenUI 仅在 `API_MODE=chat` 下生效：模型可调用 `render_ui` 输出受控 JSON DSL，后端发送 `ui_surface_*` SSE 事件，前端递归渲染 `text/card/row/column/table/button`。Phase 3b 起，带 `action.event_name` 的按钮会调用 `/api/ui_action` 新启 SSE 流；模型也可调用 `update_ui_data` 按 JSON Pointer 更新已有 surface 数据。UI surface/action 不进入 Memory 或归档。
+
+> Phase 4 Plan-and-Execute 仅在 `API_MODE=chat` 下生效：模型可调用 `create_plan` 发起可编辑计划，前端用 `activity_snapshot` / `activity_delta` 渲染和更新步骤状态，用户通过 `/api/plan_confirm` 确认后逐步执行；失败步骤可在决策卡中编辑后继续。计划不进入 Memory 或归档。
+
+> Phase 5 Checkpoint/Resume 会把 HITL pending、UI surface/action、Plan 状态保存到 `data/runtime_state/{session_id}.json`。页面刷新或服务重启后，前端通过 `GET /api/runtime_state?session_id=...` 恢复待处理卡片和可交互 UI；运行中的计划会显示“继续执行”并调用 `/api/plan_continue`。chat archive markdown 格式保持不变。
+
+> Phase 6 Confidence Signal 会让模型在最终回答末尾输出供后端解析的置信度标记，后端结合工具调用启发式发送 `confidence_signal` SSE。标记剥离采用“疑似 marker 前缀暂存”，不会固定扣留短答案尾部。低置信度回答会显示为草稿，用户通过 `/api/confidence_decision` 采纳后才写入 Memory；丢弃则不进入归档。
 
 ### CLI
 

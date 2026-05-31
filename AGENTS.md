@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## Project purpose
 
@@ -175,7 +175,8 @@ Serialization lives on `Memory.to_markdown(session_id)` / `Memory.from_markdown(
 | `POST` | `/api/resume` | HITL resume:body `{session_id, tool_call_id, decision: "answer"\|"approve"\|"reject", answer?}`,启**新**SSE 流继续 ReAct 循环。404 = 该 session 无 pending HITL;409 = `tool_call_id` 与 pending awaiting 不匹配(pending 会被还回去允许重试)。仅 `API_MODE=chat` + HITL 工具触发时才会有 pending 可恢复。 |
 | `POST` | `/api/ui_action` | Declarative UI button action:body `{session_id, surface_id, component_id, event_name}`,校验内存态 surface/action 后启**新**SSE 流继续 ReAct。仅 `API_MODE=chat` 可用;404 = surface/action 不存在;409 = event_name mismatch。 |
 | `POST` | `/api/plan_confirm` | Plan-and-Execute confirm:body `{session_id, plan_id, steps}`,用户确认/编辑计划后启**新**SSE 流逐步执行。仅 `API_MODE=chat` 可用;404 = plan 不存在;409 = 状态不匹配。 |
-| `POST` | `/api/plan_decision` | Plan step failure decision:body `{session_id, plan_id, step_id, decision, steps?}`,支持 `skip` / `retry` / `update` 后继续执行。 |
+| `POST` | `/api/plan_decision` | Plan step failure decision:body `{session_id, plan_id, step_id, decision, steps?}`,支持 `skip` / `retry` / `update` 后继续执行;`update` 保留已完成/已跳过步骤状态,只重置失败步骤。 |
+| `POST` | `/api/plan_continue` | Resume a restored running plan:body `{session_id, plan_id}`。仅当 runtime state 中 plan 仍是 `running` 且保留 `execution_messages/current_step_index` 时可用。 |
 | `POST` | `/api/confidence_decision` | Confidence draft decision:body `{session_id, draft_id, decision:"accept"\|"discard"}`。`accept` 才把低置信度草稿写入 Memory;`discard` 只删除草稿。 |
 | `POST` | `/api/reset` | Clear current session memory + delete archive; session_id preserved |
 | `POST` | `/api/archive` | Cover-write current Memory to disk; empty → `{ok, skipped:true}` |
@@ -232,9 +233,9 @@ All payloads are JSON.
   4. 测试:发请求触发该工具,前端应显示 loading → 卡片(或 error)
   5. 注意:`responses` 模式的内置 web_search 是不透明的(无 `tool_call_id`),卡片事件不会触发——该模式仅有 `search_status` banner
 - **Phase 3 声明式 UI (`render_ui` / `update_ui_data`,仅 `chat` 模式生效)**:`RENDER_UI_TOOL` 与 `UPDATE_UI_DATA_TOOL` 不放入 HITL `LOCAL_TOOLS`,而是通过 `IMMEDIATE_LOCAL_TOOLS` 本地立即执行。`render_ui` 参数为 `{surface_id, components, data?}`,其中 `components` 是扁平数组且必须包含 `id="root"`;`button.action` 约定为 `{event_name, context?}`。后端把 surface/action 存进 `_UI_SURFACES`,不进入 Memory / markdown 归档;Phase 5 会把它同步到 runtime sidecar 以支持刷新/重启恢复。前端 `DeclarativeRenderer` 支持 `text/card/row/column/table/button`;所有文本用 `textContent`,不执行 HTML/JS。带 action 的 button 点击 `POST /api/ui_action`,新启 SSE 流继续 ReAct;后端只信任 registry 中保存的 action context。`update_ui_data(surface_id, path, value)` 按 JSON Pointer 更新 data 并发送 `ui_data_update`。CLI 遇到本地立即 UI 工具只喂回 Web-only 文本结果,不渲染 UI。
-- **Phase 4 Plan-and-Execute (`create_plan`,仅 `chat` 模式生效)**:`create_plan` 是 HITL `LOCAL_TOOLS` 工具,`_LOCAL_TOOL_KIND["create_plan"]="plan"`。模型调用后后端注册 `_PLANS[session_id][plan_id]`,yield `activity_snapshot` + `await_user(kind="plan")` + `done`;前端展示可编辑计划卡(上移/下移/删除/新增),确认后 `POST /api/plan_confirm`。计划执行使用每步小 ReAct 预算(`PLAN_STEP_MAX_ROUNDS = 3`),通过 `activity_delta` 更新步骤状态;失败时 `await_user(kind="plan_decision")`,用户可 `skip` / `retry` / `update`。计划状态不进入 Memory / markdown 归档,但 Phase 5 会同步到 runtime sidecar;全部完成后只写入一条计划完成摘要。
-- **Phase 5 Checkpoint/Resume**:`chat_core._restore_runtime_state(session_id)` 在 chat/resume/ui_action/plan/history/runtime snapshot 入口懒加载 JSON sidecar;`_save_runtime_state(session_id)` 在 pending/surface/plan mutation 后原子写入。前端在 `loadHistory()` 后调用 `loadRuntimeState()` 追加恢复出来的 HITL bubble、Declarative UI surface 和 Plan 卡片。不要把后端私有恢复字段(`messages/tools/remaining_tool_calls`)暴露到 `/api/runtime_state`。
-- **Phase 6 Confidence Signal**:system prompt 要求最终回答末尾输出 `[confidence: 0.0-1.0 | reason: ...]`;`chat_core` 用尾部缓冲剥离该 marker,再发送 `confidence_signal`。低置信度阈值是 `<0.55`,中置信度是 `<0.8`。低置信度回答不立即写入 Memory,而是注册 `_ANSWER_DRAFTS`;`POST /api/confidence_decision` 的 `accept` 才写入 Memory,`discard` 不写入。草稿不进入 runtime_state 或 archive。
+- **Phase 4 Plan-and-Execute (`create_plan`,仅 `chat` 模式生效)**:`create_plan` 是 HITL `LOCAL_TOOLS` 工具,`_LOCAL_TOOL_KIND["create_plan"]="plan"`。模型调用后后端注册 `_PLANS[session_id][plan_id]`,yield `activity_snapshot` + `await_user(kind="plan")` + `done`;前端展示可编辑计划卡(上移/下移/删除/新增),确认后 `POST /api/plan_confirm`。计划执行使用每步小 ReAct 预算(`PLAN_STEP_MAX_ROUNDS = 3`),通过 `activity_delta` 更新步骤状态;失败时 `await_user(kind="plan_decision")`,用户可 `skip` / `retry` / `update`,其中 `update` 的决策卡自身可编辑,后端保留 done/skipped 步骤状态与摘要并只重置失败步骤。计划状态不进入 Memory / markdown 归档,但 Phase 5 会同步到 runtime sidecar;全部完成后写入一条计划完成摘要并从 `_PLANS` / sidecar 回收。
+- **Phase 5 Checkpoint/Resume**:`chat_core._restore_runtime_state(session_id)` 在 chat/resume/ui_action/plan/history/runtime snapshot 入口懒加载 JSON sidecar;`_save_runtime_state(session_id)` 在 pending/surface/plan mutation 后原子写入。前端在 `loadHistory()` 后调用 `loadRuntimeState()` 追加恢复出来的 HITL bubble、Declarative UI surface 和 Plan 卡片。`GET /api/runtime_state` 对可继续的 running plan 暴露 `continuable:true`,前端可调用 `POST /api/plan_continue` 继续执行;不要把后端私有恢复字段(`messages/tools/remaining_tool_calls`)暴露到 `/api/runtime_state`。损坏或结构异常的 sidecar 应 warning 后忽略,不能让 history/chat/runtime snapshot 500。
+- **Phase 6 Confidence Signal**:system prompt 要求最终回答末尾输出 `[confidence: 0.0-1.0 | reason: ...]`;`chat_core` 只在尾部疑似 marker 前缀时暂存并剥离该 marker,再发送 `confidence_signal`,不要恢复固定长度尾缓冲以免破坏短答案流式体验。低置信度阈值是 `<0.55`,中置信度是 `<0.8`。低置信度回答不立即写入 Memory,而是注册 `_ANSWER_DRAFTS`;`POST /api/confidence_decision` 的 `accept` 才写入 Memory,`discard` 不写入。草稿不进入 runtime_state 或 archive。
 - **ReAct max iterations**: `MAX_ROUNDS = 5` in `chat_core.py` applies to both CLI and Web,**两条路径(text-protocol 与 native function-calling)共用同一上限**。Bump if you need longer tool chains.
 - **Adding a tool that returns large text**: respect the `TOOL_RESULT_PREVIEW_CHARS` truncation (defined in `chat_core.py`) in the SSE `tool_result` event(`_truncate_tool_result` 在 chat-native 路径用,文本协议路径里 `stream_agent_response` 直接 inline 截断),或 refactor the event contract to carry metadata-only with a separate streaming channel。注意:**喂回模型的 messages 中 `role=tool` 的 content 是 full text**,前端 SSE 才截断 —— 模型需要看完整结果,UI 只需要预览。
 - **Frontend XSS surface**: LLM-produced markdown is rendered via `DOMPurify.sanitize(marked.parse(...))` (the `renderMarkdown` helper); user-authored content is rendered via `textContent` only (no markdown parse). The chat view, anchor panel, and archive-preview modal all follow this split. Don't bypass DOMPurify when adding new render paths, and don't promote user input to markdown.
@@ -245,4 +246,4 @@ All payloads are JSON.
 
 ## Skills present in the repo
 
-`.claude/skills/` and `.agents/skills/` contain installed skill bundles (`ata-all`, `ale-file-parser`). These are tooling for Claude Code itself, not part of the demo's runtime.
+`.Codex/skills/` and `.agents/skills/` contain installed skill bundles (`ata-all`, `ale-file-parser`). These are tooling for Codex itself, not part of the demo's runtime.

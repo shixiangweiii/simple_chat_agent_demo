@@ -28,21 +28,36 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from chat_core import (  # noqa: E402
+    DraftNotFound,
     HistoryNotFound,
     InvalidSessionId,
     MODEL,
     PendingMismatch,
     PendingNotFound,
+    PlanNotFound,
+    PlanStateMismatch,
+    PlanUnavailable,
+    PlanValidationError,
+    UiActionMismatch,
+    UiActionNotFound,
+    UiActionUnavailable,
+    UiSurfaceNotFound,
     archive_session,
+    confidence_decision,
     delete_session,
     get_archive_path_if_exists,
     get_or_load,
     list_sessions,
+    plan_confirm_response,
+    plan_continue_response,
+    plan_decision_response,
     read_history,
     reset_session,
     resume_chat_response,
+    runtime_state_snapshot,
     session_count,
     stream_agent_response,
+    ui_action_response,
 )
 
 
@@ -67,10 +82,16 @@ app = FastAPI(title="Simple Chat Agent")
 # 请求体模型
 # ============================================================
 
+class ChatContext(BaseModel):
+    viewport_width: int | None = None
+    selected_text: str | None = None
+    session_message_count: int | None = None
+
+
 class ChatRequest(BaseModel):
     session_id: str
     message: str
-    context: dict | None = None
+    context: ChatContext | None = None
 
 
 class ResetRequest(BaseModel):
@@ -92,6 +113,38 @@ class ResumeRequest(BaseModel):
     tool_call_id: str
     decision: Literal["answer", "approve", "reject"]
     answer: str | None = None
+
+
+class UiActionRequest(BaseModel):
+    session_id: str
+    surface_id: str
+    component_id: str
+    event_name: str
+
+
+class PlanConfirmRequest(BaseModel):
+    session_id: str
+    plan_id: str
+    steps: list[dict]
+
+
+class PlanDecisionRequest(BaseModel):
+    session_id: str
+    plan_id: str
+    step_id: str
+    decision: Literal["skip", "retry", "update"]
+    steps: list[dict] | None = None
+
+
+class PlanContinueRequest(BaseModel):
+    session_id: str
+    plan_id: str
+
+
+class ConfidenceDecisionRequest(BaseModel):
+    session_id: str
+    draft_id: str
+    decision: Literal["accept", "discard"]
 
 
 # ============================================================
@@ -124,6 +177,15 @@ async def health() -> dict:
     return {"ok": True, "model": MODEL, "sessions": session_count()}
 
 
+@app.get("/api/runtime_state")
+async def runtime_state(session_id: str) -> dict:
+    """返回前端可恢复 UI 用的 session 运行态快照。"""
+    try:
+        return runtime_state_snapshot(session_id)
+    except InvalidSessionId:
+        raise HTTPException(status_code=400, detail="invalid session_id")
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     # 用 get_or_load 替代 setdefault:即使前端没主动调 /api/history,
@@ -132,7 +194,13 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         memory = get_or_load(req.session_id)
     except InvalidSessionId:
         raise HTTPException(status_code=400, detail="invalid session_id")
-    events = stream_agent_response(memory, req.message, request.is_disconnected, req.session_id, req.context)
+    if req.context is None:
+        context = None
+    elif hasattr(req.context, "model_dump"):
+        context = req.context.model_dump(exclude_none=True)
+    else:
+        context = req.context.dict(exclude_none=True)
+    events = stream_agent_response(memory, req.message, request.is_disconnected, req.session_id, context)
     return StreamingResponse(
         _sse_stream(events),
         media_type="text/event-stream",
@@ -165,6 +233,127 @@ async def resume(req: ResumeRequest, request: Request) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/ui_action")
+async def ui_action(req: UiActionRequest, request: Request) -> StreamingResponse:
+    """声明式 UI button action 回传:校验后新启一条 SSE 流继续 ReAct。"""
+    try:
+        events = ui_action_response(
+            req.session_id,
+            req.surface_id,
+            req.component_id,
+            req.event_name,
+            request.is_disconnected,
+        )
+    except InvalidSessionId:
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    except UiActionUnavailable as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except UiSurfaceNotFound:
+        raise HTTPException(status_code=404, detail="ui surface not found")
+    except UiActionNotFound:
+        raise HTTPException(status_code=404, detail="ui action not found")
+    except UiActionMismatch:
+        raise HTTPException(status_code=409, detail="ui action mismatch")
+    return StreamingResponse(
+        _sse_stream(events),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/plan_confirm")
+async def plan_confirm(req: PlanConfirmRequest, request: Request) -> StreamingResponse:
+    """用户确认/编辑计划后,新启 SSE 流逐步执行计划。"""
+    try:
+        events = plan_confirm_response(
+            req.session_id,
+            req.plan_id,
+            req.steps,
+            request.is_disconnected,
+        )
+    except InvalidSessionId:
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    except PlanUnavailable as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PlanValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PlanNotFound:
+        raise HTTPException(status_code=404, detail="plan not found")
+    except PlanStateMismatch:
+        raise HTTPException(status_code=409, detail="plan state mismatch")
+    return StreamingResponse(
+        _sse_stream(events),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/plan_decision")
+async def plan_decision(req: PlanDecisionRequest, request: Request) -> StreamingResponse:
+    """计划步骤失败后的跳过/重试/修改后继续。"""
+    try:
+        events = plan_decision_response(
+            req.session_id,
+            req.plan_id,
+            req.step_id,
+            req.decision,
+            req.steps,
+            request.is_disconnected,
+        )
+    except InvalidSessionId:
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    except PlanUnavailable as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PlanValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PlanNotFound:
+        raise HTTPException(status_code=404, detail="plan not found")
+    except PlanStateMismatch:
+        raise HTTPException(status_code=409, detail="plan state mismatch")
+    return StreamingResponse(
+        _sse_stream(events),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/plan_continue")
+async def plan_continue(req: PlanContinueRequest, request: Request) -> StreamingResponse:
+    """恢复 running plan 的执行流。"""
+    try:
+        events = plan_continue_response(
+            req.session_id,
+            req.plan_id,
+            request.is_disconnected,
+        )
+    except InvalidSessionId:
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    except PlanUnavailable as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PlanValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PlanNotFound:
+        raise HTTPException(status_code=404, detail="plan not found")
+    except PlanStateMismatch:
+        raise HTTPException(status_code=409, detail="plan state mismatch")
+    return StreamingResponse(
+        _sse_stream(events),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/confidence_decision")
+async def confidence_decision_route(req: ConfidenceDecisionRequest) -> dict:
+    """低置信度草稿采纳/丢弃。accept 才写入 Memory。"""
+    try:
+        return confidence_decision(req.session_id, req.draft_id, req.decision)
+    except InvalidSessionId:
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    except DraftNotFound:
+        raise HTTPException(status_code=404, detail="draft not found")
 
 
 @app.post("/api/reset")
