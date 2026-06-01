@@ -15,6 +15,7 @@ The demo is split into three layers under `demo/` (HTTP / 业务 / LLM 底层) �
 - Dependencies in `requirements.txt`. A `.venv` is checked into the working tree but git-ignored.
 - Install: `pip install -r requirements.txt`
 - API key: both entry points read `DASHSCOPE_API_KEY` from env. Both refuse to start if it's missing.
+- Optional override: `DASHSCOPE_API_KEY_MCP` env var for MCP tool calls (only used in `API_MODE=chat`). Falls back to `DASHSCOPE_API_KEY` if not set. Setting a separate key allows LLM and MCP to use different API keys with different permissions/quotas.
 - Optional override: `QWEN_MODEL` env var picks the model (defaults to `qwen3.7-max`, required by the Responses API + built-in `web_search` tool — `qwen-plus` will not work).
 - Optional override: `API_MODE` env var picks the underlying LLM call protocol — `responses` (default, `client.responses.create`, supports built-in `web_search` lifecycle) or `chat` (`client.chat.completions.create` + native function calling against the DashScope **WebSearch MCP server**, lifecycle visible via `tool_call` / `tool_result` SSE events). Case-insensitive; invalid values raise at module load. See "LLM API mode switch" below.
 - The `mcp>=1.10` Python SDK is required for `API_MODE=chat` (it talks streamableHttp to the WebSearch MCP server at `https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp`). `responses` mode does not need MCP — its web_search is built into the Responses API.

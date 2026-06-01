@@ -28,6 +28,15 @@ def main():
         )
         return
 
+    # chat 模式需要 MCP key;如果未单独设 DASHSCOPE_API_KEY_MCP,将 fallback 使用 DASHSCOPE_API_KEY
+    from chat_core import API_MODE  # noqa: E402 (已在上面 sys.path.insert)
+    if API_MODE == "chat" and not os.environ.get("DASHSCOPE_API_KEY_MCP"):
+        print(
+            "提示: API_MODE=chat 下 MCP 联网搜索将使用 DASHSCOPE_API_KEY (fallback)。\n"
+            "如需 MCP 使用独立 key,请: export DASHSCOPE_API_KEY_MCP=sk-xxx",
+            file=sys.stderr,
+        )
+
     memory = Memory()
     print("通用聊天 Agent 已启动，请开始对话（输入 exit 退出）", file=sys.stderr)
 

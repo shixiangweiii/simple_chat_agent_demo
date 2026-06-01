@@ -24,5 +24,7 @@
 https://dashscope.aliyuncs.com/api/v1/mcps/WebSearch/mcp
 
 #### 鉴权方式
+- MCP 调用优先读取环境变量 `DASHSCOPE_API_KEY_MCP`，未设置时 fallback 到 `DASHSCOPE_API_KEY`
 - 获取 DASHSCOPE_API_KEY，并添加至 header 中进行鉴权，鉴权方式参考：获取 DASHSCOPE_API_KEY，替换配置文件中的${DASHSCOPE_API_KEY}
 - 环境变量配置 DASHSCOPE_API_KEY 使用，例如：export DASHSCOPE_API_KEY=sk-xxxx
+- 如需 MCP 使用独立 key：export DASHSCOPE_API_KEY_MCP=sk-xxxx

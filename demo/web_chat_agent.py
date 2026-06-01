@@ -72,6 +72,15 @@ if not os.environ.get("DASHSCOPE_API_KEY"):
     )
     sys.exit(1)
 
+# chat 模式需要 MCP key;如果未单独设 DASHSCOPE_API_KEY_MCP,将 fallback 使用 DASHSCOPE_API_KEY
+if not os.environ.get("DASHSCOPE_API_KEY_MCP"):
+    # chat_core 已 import,可直接读 API_MODE
+    if API_MODE == "chat":
+        logger.info(
+            "API_MODE=chat 下 MCP 联网搜索将使用 DASHSCOPE_API_KEY (fallback)。"
+            "如需 MCP 使用独立 key,请: export DASHSCOPE_API_KEY_MCP=sk-xxx"
+        )
+
 
 STATIC_DIR = Path(__file__).parent / "static"
 

@@ -12,6 +12,7 @@
     - MODEL / API_MODE             从 llm_client 重新导出,便于上层只 import 本层
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -58,6 +59,99 @@ PLAN_STEP_MAX_ROUNDS = 3
 CONFIDENCE_LOW_THRESHOLD = 0.55
 CONFIDENCE_MEDIUM_THRESHOLD = 0.8
 CONFIDENCE_REASON_MAX_CHARS = 240
+
+
+# ============================================================
+# 真 shell 执行开关 (默认关闭,demo 安全态)
+# ============================================================
+# 仅在用户显式 export ALLOW_REAL_SHELL=1 时,execute_shell_command + approve 路径
+# 才会真正调起 subprocess。否则保持 demo stub 行为 —— 这是 demo 长期以来的
+# non-goal,故意不真执行 shell,避免被 clone 后默认变成 RCE 风险。
+# 开关只影响 _resume_inner 中 approve 分支;reject 与 CLI 短路逻辑都不动。
+# 与 API_MODE / MODEL 一致,采用 env-once-at-import 模式,改值需重启进程。
+ALLOW_REAL_SHELL = os.getenv("ALLOW_REAL_SHELL", "0") == "1"
+
+# 真执行时:30s 硬超时,8KB 输出截断后再喂模型(模型仍能看到截断标记)。
+SHELL_EXEC_TIMEOUT_SEC = 30
+SHELL_EXEC_OUTPUT_MAX_CHARS = 8000
+
+# 最小护栏:命令字符串包含下列任一关键词即拒绝。黑名单不是绝对防御,
+# 只是把"误删 / 反弹 shell / 篡改系统"类常见动作挡住;白名单太严会让
+# demo 失去演示价值。真正的隔离应该交给容器 / 虚拟用户 / 沙箱。
+_SHELL_DENY_PATTERNS = (
+    "rm -rf", "mkfs", "dd if=", " :(){", "shutdown", "reboot",
+    "sudo ", "curl ", "wget ", "| sh", "| bash",
+    "/etc/passwd", "/etc/shadow", ">/dev/sda", "chmod 777 /",
+)
+
+
+def _looks_dangerous(cmd: str) -> str | None:
+    """命中黑名单返回拒绝原因字符串(命中的 pattern);否则返回 None。"""
+    low = cmd.lower()
+    for pat in _SHELL_DENY_PATTERNS:
+        if pat in low:
+            return pat
+    return None
+
+
+async def _execute_shell_real(cmd: str) -> str:
+    """真正执行 shell 命令并返回拼装好的 tool_result 字符串。
+
+    返回字符串会作为 role=tool 的 content 直接喂给模型,所以前缀加 [exit=N]
+    让模型能区分成功/失败。stderr 合并到 stdout,避免模型只看到一半。
+    超时 / 黑名单 / 异常都不抛,统一转成可读字符串,与 mcp_web_search 的
+    `工具调用失败: ...` 失败语义一致 —— 让模型在 ReAct 循环里能恢复。
+    """
+    blocked = _looks_dangerous(cmd)
+    if blocked:
+        logger.warning("shell denied: pattern=%r cmd=%s", blocked, cmd)
+        return (
+            f"[拒绝执行] 命令包含敏感模式 {blocked!r},已被本地黑名单拦截。"
+            "如确需执行,请人工在 shell 直接运行或调整黑名单。"
+        )
+
+    logger.info("shell exec start: %s", cmd)
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except Exception as e:
+        logger.exception("shell spawn failed: %s", cmd)
+        return f"[执行失败] 无法启动子进程: {e}"
+
+    # 有界读取:只从 stdout 管道读 MAX+1 字节作探针,内存峰值 ~8KB 而不是无界。
+    # 不用 proc.communicate() —— 它会把全部 stdout 读进内存,遇到 `yes` 等
+    # 高速产出命令时 30s 窗口内能堆 GB 级数据,直接 OOM 整个 server。
+    try:
+        raw = await asyncio.wait_for(
+            proc.stdout.read(SHELL_EXEC_OUTPUT_MAX_CHARS + 1),
+            timeout=SHELL_EXEC_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        logger.warning("shell timeout after %ss: %s", SHELL_EXEC_TIMEOUT_SEC, cmd)
+        return f"[超时] 命令执行超过 {SHELL_EXEC_TIMEOUT_SEC}s,已强制终止: {cmd}"
+
+    raw_len = len(raw)
+    truncated = raw_len > SHELL_EXEC_OUTPUT_MAX_CHARS
+    if truncated:
+        # 还有未读字节 → 命令仍可能在产出 → 杀掉进程止血,管道里剩余数据随进程关闭自动 GC
+        proc.kill()
+        await proc.wait()
+        text = raw[:SHELL_EXEC_OUTPUT_MAX_CHARS].decode("utf-8", errors="replace")
+        text += "\n...(输出过长,已截断)"
+    else:
+        await proc.wait()
+        text = raw.decode("utf-8", errors="replace")
+
+    logger.info(
+        "shell exec done: exit=%s out_bytes=%d truncated=%s cmd=%s",
+        proc.returncode, raw_len, truncated, cmd,
+    )
+    return f"[exit={proc.returncode}]\n{text}"
 
 
 # ============================================================
@@ -2293,12 +2387,16 @@ async def _resume_inner(
         tool_result = answer or "(用户未提供答复)"
     elif name == "execute_shell_command":
         if decision == "approve":
-            # demo 不真执行 shell —— 教学焦点是 HITL 流程,不引入真实 RCE 风险
             cmd = awaiting["args"].get("command", "")
-            tool_result = (
-                f"[demo stub] 已模拟执行命令: {cmd}\n"
-                "(本 demo 不会真正执行 shell,仅演示 HITL 审批流程)"
-            )
+            if ALLOW_REAL_SHELL:
+                # 开关开启:真执行。失败/超时/黑名单都被 _execute_shell_real 转成字符串。
+                tool_result = await _execute_shell_real(cmd)
+            else:
+                # 默认安全态:不真执行,沿用原 demo stub。文案提示开关存在,避免被误判为 bug。
+                tool_result = (
+                    f"[demo stub] 已模拟执行命令: {cmd}\n"
+                    "(本 demo 默认不真执行 shell,导出 ALLOW_REAL_SHELL=1 后才会真执行)"
+                )
         else:  # reject
             tool_result = f"用户拒绝执行。理由: {answer or '(未填写)'}"
     else:

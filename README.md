@@ -23,10 +23,21 @@ pip install -r requirements.txt
 两个入口都从环境变量读 API key：
 
 ```bash
-export DASHSCOPE_API_KEY=sk-xxx        # 必填
+export DASHSCOPE_API_KEY=sk-xxx        # 必填，LLM 调用用
+export DASHSCOPE_API_KEY_MCP=sk-xxx    # 可选，MCP 联网搜索用；缺失时 fallback 到 DASHSCOPE_API_KEY
 export QWEN_MODEL=qwen3.7-max          # 可选，默认 qwen3.7-max
 export API_MODE=responses              # 可选，responses(默认) 或 chat
+export ALLOW_REAL_SHELL=0              # 可选，默认 0(不真执行 shell)
 ```
+
+> `DASHSCOPE_API_KEY_MCP` 仅在 `API_MODE=chat` 下生效（MCP 联网搜索路径需要鉴权）。
+> 如果未设置，MCP 调用将 fallback 使用 `DASHSCOPE_API_KEY`。设置独立 key 的好处:
+> LLM 和 MCP 可以用不同权限/配额的 API key，避免互相影响。
+
+> `ALLOW_REAL_SHELL=1` 时（仅 `API_MODE=chat`），HITL 审批通过的 `execute_shell_command`
+> 会真正调 `asyncio.create_subprocess_shell` 执行（30s 超时、stderr 合并 stdout、8KB 截断、
+> 命令含 `rm -rf` / `sudo ` / `curl ` / `| sh` / `/etc/passwd` 等敏感模式时直接拒绝）。
+> 默认关闭，demo 仍走 `[demo stub] 已模拟执行命令: ...` 字符串，避免被 clone 后变成默认 RCE 风险。
 
 > Phase 1 Static GenUI 的搜索结果卡片只在 `API_MODE=chat` 下生效：该模式通过 Chat Completions native function calling 调用 DashScope WebSearch MCP 工具，后端能拿到 `tool_call_id` 和完整工具结果并发送 `component_*` SSE 事件。默认 `responses` 模式仍保留内置 `web_search` 的 `search_status` 横幅，不会生成搜索结果卡片。
 

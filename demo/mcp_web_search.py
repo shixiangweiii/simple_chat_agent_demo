@@ -4,7 +4,8 @@
 chat_core 在 API_MODE=chat 路径上调用本模块的 discover_tool_spec / call_tool_async。
 
 env:
-    DASHSCOPE_API_KEY  调 list_tools / call_tool 时从 env 读取,缺失抛 RuntimeError
+    DASHSCOPE_API_KEY_MCP  调 list_tools / call_tool 时从 env 读取;缺失时 fallback
+                           到 DASHSCOPE_API_KEY;两者都缺失抛 RuntimeError
 """
 
 import asyncio
@@ -40,11 +41,12 @@ _tool_spec_cache: list[dict] | None = None
 # ============================================================
 
 def _build_headers() -> dict[str, str]:
-    api_key = os.environ.get("DASHSCOPE_API_KEY")
+    api_key = os.environ.get("DASHSCOPE_API_KEY_MCP") or os.environ.get("DASHSCOPE_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "未配置环境变量 DASHSCOPE_API_KEY\n"
-            "用法: export DASHSCOPE_API_KEY=sk-xxx"
+            "未配置环境变量 DASHSCOPE_API_KEY_MCP(也找不到 DASHSCOPE_API_KEY 作为 fallback)\n"
+            "用法: export DASHSCOPE_API_KEY_MCP=sk-xxx\n"
+            "  或: export DASHSCOPE_API_KEY=sk-xxx(将同时用于 LLM 和 MCP)"
         )
     return {"Authorization": f"Bearer {api_key}"}
 
