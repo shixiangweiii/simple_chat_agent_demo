@@ -327,6 +327,22 @@
     transition: border-color 0.15s;
   }
   .hitl-input:focus { border-color: var(--primary); }
+  /* Phase 9a steer */
+  .steer-tag { display: inline-block; padding: 1px 6px; margin-right: 4px;
+    background: #f59e0b; color: #fff; border-radius: 4px;
+    font-size: 11px; font-weight: 600; vertical-align: middle; }
+  /* Phase 9b agent state panel */
+  .agent-state-panel { padding: 6px 16px; font-size: 12px; color: var(--text-muted);
+    background: #f8fafc; border-bottom: 1px solid var(--border);
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    min-height: 28px; }
+  .agent-state-panel .ag-pill { padding: 1px 8px; background: #fff;
+    border: 1px solid var(--border); border-radius: 10px; }
+  .agent-state-panel .ag-pill.steer { background: #fef3c7; border-color: #fcd34d; }
+  .agent-state-panel .ag-muted { color: #9ca3af; font-style: italic; }
+  .system-note { padding: 4px 10px; margin: 6px auto; max-width: 720px;
+    font-size: 12px; color: var(--text-muted); text-align: center;
+    background: #f0fdf4; border-radius: 6px; }
   .hitl-actions {
     display: flex;
     gap: 8px;
@@ -543,6 +559,68 @@
     content: '';
   }
   @keyframes dots { 0% { content: ''; } 25% { content: '.'; } 50% { content: '..'; } 75% { content: '...'; } }
+
+  /* ---------- Phase 10a: 图片附件 ---------- */
+  .attached-images {
+    display: flex;
+    gap: 8px;
+    padding: 8px 16px 0;
+    flex-wrap: wrap;
+    background: var(--panel);
+  }
+  .attached-images:empty { display: none; }
+  .thumb {
+    position: relative;
+    width: 80px;
+    height: 80px;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .thumb .rm {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(0,0,0,0.55);
+    color: #fff;
+    font-size: 12px;
+    line-height: 20px;
+    text-align: center;
+    cursor: pointer;
+    padding: 0;
+    transition: background 0.15s;
+  }
+  .thumb .rm:hover { background: rgba(200,0,0,0.75); }
+  button.attach-btn {
+    background: transparent;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 0 10px;
+    font-size: 18px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    line-height: 1;
+    min-height: 42px;
+    display: flex;
+    align-items: center;
+  }
+  button.attach-btn:hover:not(:disabled) { background: var(--hover); border-color: var(--primary); }
+  button.attach-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .input-bar.drag-over {
+    outline: 2px dashed var(--primary);
+    outline-offset: -2px;
+    border-radius: 8px;
+  }
 
   .input-bar {
     display: flex;
@@ -1027,6 +1105,67 @@
     cursor: not-allowed;
   }
 
+  /* Phase 8b: 表单组件 (text_field / select / toggle) */
+  .ui-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 6px 0;
+  }
+  .ui-field-label {
+    font-size: 12px;
+    color: var(--muted);
+    font-weight: 500;
+  }
+  .ui-field-input {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 9px;
+    font-size: 13px;
+    font-family: inherit;
+    background: #fff;
+    color: var(--text);
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .ui-field-input:focus {
+    border-color: var(--primary);
+  }
+  textarea.ui-field-input {
+    min-height: 60px;
+    resize: vertical;
+  }
+  .ui-field-select {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 13px;
+    font-family: inherit;
+    background: #fff;
+    color: var(--text);
+    cursor: pointer;
+  }
+  .ui-field-checkgroup {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .ui-field-checkitem {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .ui-field-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    cursor: pointer;
+    margin: 6px 0;
+  }
+
   /* Phase 2: 上下文感知 UI hint */
   #messages.compact-mode .msg:nth-last-child(n+7) { display: none; }
   #messages.compact-mode::before {
@@ -1067,10 +1206,16 @@
         <button class="reset-btn" id="reset" title="清空当前会话内存与归档,session_id 保留">重置</button>
       </div>
     </header>
+    <!-- Phase 9b: Agent 全局状态纲要面板 (sticky, 流活跃时可见) -->
+    <div id="agentStatePanel" class="agent-state-panel" hidden></div>
     <div class="messages" id="messages">
       <div class="empty" id="empty">输入消息开始对话（Enter 发送，Shift+Enter 换行）</div>
     </div>
+    <!-- Phase 10a: 已选图片缩略图条, 空时 CSS :empty 折叠 -->
+    <div class="attached-images" id="attached-images"></div>
     <div class="input-bar">
+      <button class="attach-btn" id="attach" title="添加图片 (≤3 张, 每张 ≤5MB)">📎</button>
+      <input type="file" id="file-input" accept="image/*" multiple style="display:none">
       <textarea id="input" placeholder="说点什么..." rows="1"></textarea>
       <button class="send" id="send">发送</button>
     </div>
@@ -1131,6 +1276,11 @@
   const $toastContainer = document.getElementById('toast-container');
   const $anchorList = document.getElementById('anchor-list');
   const $anchorCount = document.getElementById('anchor-count');
+  // Phase 10a: 图片附件
+  const $attach = document.getElementById('attach');
+  const $fileInput = document.getElementById('file-input');
+  const $attachedImages = document.getElementById('attached-images');
+  const $inputBar = document.querySelector('.input-bar');
 
   // ---------- 锚点面板状态 ----------
   // 用户消息计数器:每次清屏归零,赋给 .msg.user 的 DOM id
@@ -1246,7 +1396,9 @@
     return cur;
   }
 
-  function jsonPointerSet(data, path, value) {
+  function jsonPointerSet(data, path, value, autoCreate = false) {
+    // Phase 8b: autoCreate=true 时,中间路径不存在的 dict key 自动建 {};
+    // 数组路径仍要求已存在(语义不清,不自动建)。仅前端表单写回路径使用。
     if (!path || path === '/') return value && typeof value === 'object' ? value : {};
     if (typeof path !== 'string' || !path.startsWith('/')) return data;
     const parts = path.slice(1).split('/').map(part => part.replace(/~1/g, '/').replace(/~0/g, '~'));
@@ -1258,6 +1410,9 @@
         if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) return data;
         cur = cur[idx];
       } else if (cur && typeof cur === 'object' && key in cur) {
+        cur = cur[key];
+      } else if (autoCreate && cur && typeof cur === 'object') {
+        cur[key] = {};
         cur = cur[key];
       } else {
         return data;
@@ -1279,6 +1434,18 @@
       return resolved == null ? '' : resolved;
     }
     return value == null ? '' : value;
+  }
+
+  // Phase 8b: 表单组件 oninput/onchange 写回 surface.data。
+  // 关键: 不触发 _renderSurface,避免销毁正在编辑的 input 焦点/光标。
+  // autoCreate=true: surface.data 未初始化深路径时自动建中间对象。
+  function writeFormValue(surface, path, value) {
+    if (!path) return;
+    try {
+      surface.data = jsonPointerSet(surface.data || {}, path, value, true);
+    } catch (e) {
+      console.warn('form value write failed:', path, e);
+    }
   }
 
   function uiNodeError(message) {
@@ -1313,9 +1480,15 @@
       if (eventName === 'ui_surface_create') {
         this._createSurface(surfaceId);
       } else if (eventName === 'ui_surface_update') {
-        this._updateComponents(surfaceId, (payload && payload.components) || []);
+        this._updateComponents(
+          surfaceId,
+          (payload && payload.components) || [],
+          (payload && payload.mode) || 'replace',
+        );
       } else if (eventName === 'ui_data_update') {
         this._updateData(surfaceId, payload && payload.path, payload && payload.value);
+      } else if (eventName === 'begin_rendering') {
+        this._confirmRendering(surfaceId);
       }
     }
 
@@ -1338,11 +1511,17 @@
       this._renderSurface(surface);
     }
 
-    _updateComponents(surfaceId, components) {
+    _updateComponents(surfaceId, components, mode = 'replace') {
       if (!surfaceId) return;
       this._createSurface(surfaceId);
       const surface = this.surfaces.get(surfaceId);
-      surface.components = new Map();
+      // Phase 8a fix B1: mode 字段对齐双端合并语义。
+      // - 'replace' (默认): 清空 Map 再装入,对应后端 complete=true 覆盖语义。
+      //   不带 mode 的 SSE(如旧客户端 / runtime_state 重放)按 replace 处理,安全且与重放空 Map 等价。
+      // - 'merge': 按 id 增量合并,对应后端 complete=false 流式语义。
+      if (mode !== 'merge') {
+        surface.components = new Map();
+      }
       if (Array.isArray(components)) {
         for (const comp of components) {
           if (comp && typeof comp.id === 'string') {
@@ -1361,7 +1540,33 @@
       this._renderSurface(surface);
     }
 
+    // Phase 7b: 确认渲染信号 —— A2UI beginRendering 语义,移除占位符,标记 surface 为已确认。
+    _confirmRendering(surfaceId) {
+      if (!surfaceId) return;
+      const surface = this.surfaces.get(surfaceId);
+      if (!surface) return;
+      surface.renderingConfirmed = true;
+      const empty = surface.dom.querySelector('.ui-surface-empty');
+      if (empty) empty.remove();
+      this._renderSurface(surface);
+    }
+
     _renderSurface(surface) {
+      // Phase 8b: 焦点保持 —— 重渲染前记录当前焦点的 uiFieldId + selection,
+      // 重渲染后按 [data-ui-field-id] 找回新元素恢复 focus + selection。
+      // 否则表单 input 一旦获得焦点并触发 surface.data 变化,光标会随 innerHTML='' 被销毁。
+      let focusedFieldId = null;
+      let savedSelStart = null;
+      let savedSelEnd = null;
+      const active = document.activeElement;
+      if (active && surface.dom.contains(active) && active.dataset && active.dataset.uiFieldId) {
+        focusedFieldId = active.dataset.uiFieldId;
+        if (typeof active.selectionStart === 'number') {
+          savedSelStart = active.selectionStart;
+          savedSelEnd = active.selectionEnd;
+        }
+      }
+
       surface.dom.innerHTML = '';
       const root = surface.components.get('root');
       if (!root) {
@@ -1372,6 +1577,18 @@
         return;
       }
       surface.dom.appendChild(this._renderNode(root, surface, 0, new Set()));
+
+      if (focusedFieldId) {
+        const restored = surface.dom.querySelector(`[data-ui-field-id="${CSS.escape(focusedFieldId)}"]`);
+        if (restored) {
+          try {
+            restored.focus();
+            if (savedSelStart !== null && typeof restored.setSelectionRange === 'function') {
+              restored.setSelectionRange(savedSelStart, savedSelEnd);
+            }
+          } catch (_e) { /* 某些元素不支持 selection,忽略 */ }
+        }
+      }
     }
 
     _renderNode(comp, surface, depth, seen) {
@@ -1480,12 +1697,121 @@
       const eventName = action && typeof action.event_name === 'string' ? action.event_name : '';
       if (eventName) {
         btn.title = '执行 UI action';
-        btn.addEventListener('click', () => sendUiAction(surface.surfaceId, comp, btn));
+        btn.addEventListener('click', () => sendUiAction(surface.surfaceId, comp, btn, surface));
       } else {
         btn.title = '此按钮没有可执行 action';
         btn.addEventListener('click', () => showToast('此按钮没有可执行 action', true));
       }
       return btn;
+    },
+    // Phase 8b: 表单组件 ——
+    // text_field: { id, type:"text_field", value_path, label?, placeholder?, input_type?:"shortText"|"longText"|"number" }
+    text_field(comp, surface) {
+      const wrap = document.createElement('div');
+      wrap.className = 'ui-field';
+      if (comp.label) {
+        const label = document.createElement('label');
+        label.className = 'ui-field-label';
+        label.textContent = String(comp.label);
+        wrap.appendChild(label);
+      }
+      const inputType = comp.input_type === 'longText' ? 'textarea'
+                      : comp.input_type === 'number' ? 'number' : 'text';
+      const el = document.createElement(inputType === 'textarea' ? 'textarea' : 'input');
+      if (inputType !== 'textarea') el.type = inputType;
+      el.className = 'ui-field-input';
+      el.dataset.uiFieldId = comp.id;
+      if (comp.placeholder) el.placeholder = String(comp.placeholder);
+      const initial = jsonPointerGet(surface.data, comp.value_path);
+      if (initial !== undefined && initial !== null) el.value = String(initial);
+      el.addEventListener('input', () => {
+        const raw = el.value;
+        const val = inputType === 'number'
+          ? (raw === '' ? null : Number(raw))
+          : raw;
+        writeFormValue(surface, comp.value_path, val);
+      });
+      wrap.appendChild(el);
+      return wrap;
+    },
+    // select: { id, type:"select", value_path, options:[{label,value}], label?, multiple? }
+    select(comp, surface) {
+      const wrap = document.createElement('div');
+      wrap.className = 'ui-field';
+      if (comp.label) {
+        const label = document.createElement('label');
+        label.className = 'ui-field-label';
+        label.textContent = String(comp.label);
+        wrap.appendChild(label);
+      }
+      const options = Array.isArray(comp.options) ? comp.options : [];
+      if (comp.multiple) {
+        // 多选用 checkbox 组,体验优于原生 <select multiple>
+        const group = document.createElement('div');
+        group.className = 'ui-field-checkgroup';
+        group.dataset.uiFieldId = comp.id;
+        const currentRaw = jsonPointerGet(surface.data, comp.value_path);
+        const currentSet = new Set(Array.isArray(currentRaw) ? currentRaw : []);
+        for (const opt of options) {
+          const item = document.createElement('label');
+          item.className = 'ui-field-checkitem';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.checked = currentSet.has(opt.value);
+          cb.addEventListener('change', () => {
+            if (cb.checked) currentSet.add(opt.value); else currentSet.delete(opt.value);
+            writeFormValue(surface, comp.value_path, Array.from(currentSet));
+          });
+          item.appendChild(cb);
+          item.appendChild(document.createTextNode(' ' + String(opt.label != null ? opt.label : opt.value)));
+          group.appendChild(item);
+        }
+        wrap.appendChild(group);
+      } else {
+        const sel = document.createElement('select');
+        sel.className = 'ui-field-select';
+        sel.dataset.uiFieldId = comp.id;
+        const current = jsonPointerGet(surface.data, comp.value_path);
+        let matched = false;
+        for (const opt of options) {
+          const o = document.createElement('option');
+          o.value = String(opt.value);
+          o.textContent = String(opt.label != null ? opt.label : opt.value);
+          if (opt.value === current || String(opt.value) === String(current)) {
+            o.selected = true;
+            matched = true;
+          }
+          sel.appendChild(o);
+        }
+        // 未匹配且无初始值时,主动写入第一个 option,避免 surface.data 与 UI 显示不一致
+        if (!matched && options.length > 0 && (current === undefined || current === null)) {
+          writeFormValue(surface, comp.value_path, options[0].value);
+        }
+        sel.addEventListener('change', () => {
+          // 尝试还原原始类型 (number / boolean)
+          const picked = options.find(o => String(o.value) === sel.value);
+          writeFormValue(surface, comp.value_path, picked ? picked.value : sel.value);
+        });
+        wrap.appendChild(sel);
+      }
+      return wrap;
+    },
+    // toggle: { id, type:"toggle", value_path, label? }
+    toggle(comp, surface) {
+      const wrap = document.createElement('label');
+      wrap.className = 'ui-field-toggle';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.dataset.uiFieldId = comp.id;
+      cb.checked = Boolean(jsonPointerGet(surface.data, comp.value_path));
+      cb.addEventListener('change', () => writeFormValue(surface, comp.value_path, cb.checked));
+      wrap.appendChild(cb);
+      if (comp.label) {
+        const span = document.createElement('span');
+        span.textContent = String(comp.label);
+        wrap.appendChild(span);
+      }
+      return wrap;
     },
   };
 
@@ -1674,18 +2000,158 @@
     scrollToBottom(true);  // 新消息时强制贴底
     return div;
   }
-  function setStreaming(streaming) {
-    $send.disabled = streaming;
-    $input.disabled = streaming;
-    $send.textContent = streaming ? '生成中...' : '发送';
+  // Phase 9a: steer mode 状态机
+  // - streamSteerActive=true 时, 输入框可用 + 按钮文案"发送纠偏" + POST /api/steer
+  // - 由 setStreaming(true, {steerable:true}) 进入, 由 setStreaming(false) / await_user handler 退出
+  // - responses 模式或 API_MODE_CACHE != 'chat' 时不进入 steer 模式 (按钮保持 "生成中...")
+  let streamSteerActive = false;
+  let API_MODE_CACHE = 'chat';  // Phase 9a + Step 10: 由 init() fetchHealth() 填充
+  const DEFAULT_INPUT_PLACEHOLDER = '输入消息（Shift+Enter 换行）';
+  const STEER_INPUT_PLACEHOLDER = '流活跃中 — 输入纠偏指令（回车发送），或等流结束';
+
+  function setStreaming(streaming, opts = {}) {
+    const wantSteerable = opts.steerable !== false && API_MODE_CACHE === 'chat';
+    if (streaming && wantSteerable) {
+      // 流活跃 + 允许 steer:输入框可用,按钮切到 steer 模式
+      streamSteerActive = true;
+      $send.dataset.mode = 'steer';
+      $send.textContent = '发送纠偏';
+      $send.disabled = false;
+      $input.disabled = false;
+      $input.placeholder = STEER_INPUT_PLACEHOLDER;
+    } else if (streaming) {
+      // 流活跃 + 不允许 steer (responses 模式 / 显式 opts.steerable=false):退化为旧行为
+      streamSteerActive = false;
+      $send.dataset.mode = 'chat';
+      $send.disabled = true;
+      $input.disabled = true;
+      $send.textContent = '生成中...';
+    } else {
+      // 流结束:恢复默认 chat 模式
+      streamSteerActive = false;
+      $send.dataset.mode = 'chat';
+      $send.disabled = false;
+      $input.disabled = false;
+      $send.textContent = '发送';
+      $input.placeholder = DEFAULT_INPUT_PLACEHOLDER;
+    }
+    // Phase 10a: attach 按钮与 streaming/steer 同步禁用 (steer 仅文本)
+    if ($attach) $attach.disabled = streaming;
   }
   function canStartStream(label = '当前') {
-    if ($send.disabled) {
+    // steer 模式下 $send.disabled=false 但仍处于流活跃, 不允许新启 chat 流
+    if ($send.disabled || streamSteerActive) {
       showToast(`${label}已有流式响应进行中，请稍候`, true);
       return false;
     }
     return true;
   }
+
+  // Phase 9b: Agent 全局状态 store —— 维护一个 agent_state_snapshot 镜像,
+  // 通过 agent_state_delta (RFC 6902 JSON Patch) 增量应用。仅支持 replace + add(/array/-)。
+  const agentStateStore = {
+    state: null,
+    replace(snapshot) {
+      this.state = snapshot && typeof snapshot === 'object' ? snapshot : null;
+    },
+    applyPatch(patch) {
+      if (!this.state || !Array.isArray(patch)) return;
+      for (const op of patch) {
+        if (!op || typeof op !== 'object') continue;
+        try {
+          if (op.op === 'replace' && typeof op.path === 'string') {
+            this.state = jsonPointerSet(this.state, op.path, op.value, true);
+          } else if (op.op === 'add' && typeof op.path === 'string' && op.path.endsWith('/-')) {
+            // 数组末尾追加
+            const arrayPath = op.path.slice(0, -2);
+            const arr = jsonPointerGet(this.state, arrayPath || '/');
+            if (Array.isArray(arr)) arr.push(op.value);
+          } else {
+            console.warn('unsupported JSON Patch op:', op);
+          }
+        } catch (e) {
+          console.warn('agent_state_delta apply failed:', op, e);
+        }
+      }
+    },
+    get() { return this.state; },
+  };
+
+  const $agentPanel = document.getElementById('agentStatePanel');
+  function renderAgentStatePanel() {
+    if (!$agentPanel) return;
+    const st = agentStateStore.get();
+    if (!st) {
+      $agentPanel.hidden = true;
+      $agentPanel.textContent = '';
+      return;
+    }
+    $agentPanel.hidden = false;
+    $agentPanel.textContent = '';
+
+    const round = typeof st.round === 'number' ? st.round : 0;
+    const roundEl = document.createElement('span');
+    roundEl.className = 'ag-pill';
+    roundEl.textContent = `Round: ${round}`;
+    $agentPanel.appendChild(roundEl);
+
+    const stats = st.tool_stats || {};
+    const toolKeys = Object.keys(stats).filter(k => stats[k]);
+    if (toolKeys.length) {
+      const toolEl = document.createElement('span');
+      toolEl.className = 'ag-pill';
+      toolEl.textContent = 'Tools: ' + toolKeys.map(k => `${k}×${stats[k]}`).join(', ');
+      $agentPanel.appendChild(toolEl);
+    }
+
+    const surfaces = Array.isArray(st.surfaces) ? st.surfaces : [];
+    if (surfaces.length) {
+      const surfEl = document.createElement('span');
+      surfEl.className = 'ag-pill';
+      surfEl.textContent = `Surfaces: ${surfaces.length}`;
+      $agentPanel.appendChild(surfEl);
+    }
+
+    const plans = Array.isArray(st.plans) ? st.plans : [];
+    if (plans.length) {
+      const planEl = document.createElement('span');
+      planEl.className = 'ag-pill';
+      planEl.textContent = `Plans: ${plans.length}`;
+      $agentPanel.appendChild(planEl);
+    }
+
+    const history = Array.isArray(st.steer_history) ? st.steer_history : [];
+    if (history.length) {
+      const steerEl = document.createElement('span');
+      steerEl.className = 'ag-pill steer';
+      const latest = history[history.length - 1];
+      const latestMsg = (latest && latest.message) ? String(latest.message) : '';
+      const preview = latestMsg.length > 40 ? latestMsg.slice(0, 40) + '…' : latestMsg;
+      steerEl.textContent = `Steers: ${history.length} · 最近: "${preview}"`;
+      $agentPanel.appendChild(steerEl);
+    }
+
+    if (!toolKeys.length && !surfaces.length && !plans.length && !history.length) {
+      const muted = document.createElement('span');
+      muted.className = 'ag-muted';
+      muted.textContent = '（Agent 已启动，等待动作）';
+      $agentPanel.appendChild(muted);
+    }
+  }
+
+  // Phase 9a: 在聊天流中插一条 system note (用于 steer_applied 反馈)
+  function appendSystemNote(text) {
+    const $messages = document.getElementById('messages');
+    if (!$messages) return;
+    const $empty = document.getElementById('empty');
+    if ($empty) $empty.remove();
+    const note = document.createElement('div');
+    note.className = 'system-note';
+    note.textContent = String(text || '');
+    $messages.appendChild(note);
+    scrollToBottom();
+  }
+
   function parseSSEBlock(block) {
     const ev = { event: 'message', data: null };
     for (const line of block.split('\n')) {
@@ -1803,6 +2269,11 @@
 
   async function loadRuntimeState(sid) {
     if (!sid) return;
+    // Phase 9b: 切换/重载会话时清空 agent state panel —— runtime_state_snapshot
+    // 是面向页面恢复的全量, 不重新合成 agent_state_payload (那个等下次 chat
+    // 流头自然发); 否则容易拼出"看起来对但与后端不一致"的状态。
+    agentStateStore.replace(null);
+    renderAgentStatePanel();
     try {
       const resp = await fetch('/api/runtime_state?session_id=' + encodeURIComponent(sid));
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -2180,7 +2651,8 @@
         } else if (
           ev.event === 'ui_surface_create' ||
           ev.event === 'ui_surface_update' ||
-          ev.event === 'ui_data_update'
+          ev.event === 'ui_data_update' ||
+          ev.event === 'begin_rendering'
         ) {
           ctx.uiRenderer.handleEvent(ev.event, ev.data || {});
           scrollToBottom();
@@ -2190,8 +2662,24 @@
         } else if (ev.event === 'activity_delta') {
           applyActivityDelta(ev.data || {});
           scrollToBottom();
+        } else if (ev.event === 'steer_applied') {
+          // Phase 9a: 服务端确认 steer 已注入 messages, 视觉提示用户
+          const msg = (ev.data && ev.data.message) || '';
+          const rnd = (ev.data && typeof ev.data.round === 'number') ? ev.data.round : '?';
+          appendSystemNote(`✓ 纠偏已注入(round ${rnd}): ${msg}`);
+        } else if (ev.event === 'agent_state_snapshot') {
+          // Phase 9b: 全局态完整快照, 覆盖 store
+          agentStateStore.replace(ev.data || {});
+          renderAgentStatePanel();
+        } else if (ev.event === 'agent_state_delta') {
+          // Phase 9b: JSON Patch 增量
+          agentStateStore.applyPatch((ev.data && ev.data.patch) || []);
+          renderAgentStatePanel();
         } else if (ev.event === 'await_user') {
           // HITL 中断:渲染 HITL bubble,本流即将结束(后端会紧接着发 done)
+          // Phase 9a: 退出 steer 模式 —— 后续 done 会再 setStreaming(false) 恢复 chat
+          streamSteerActive = false;
+          $send.dataset.mode = 'chat';
           ctx.flipToAnswering();
           ctx.clearSearchStatus();
           ctx.awaitingUser = true;
@@ -2272,26 +2760,172 @@
     // unknown/chat → 仅清除，不做额外操作
   }
 
+  // ============================================================
+  // Phase 10a: 图片附件 — base64 data URL 内嵌, 不走文件上传 API
+  // ============================================================
+  const MAX_IMAGES = 3;
+  const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB 原图
+  let attachedImages = []; // string[] of data URLs
+
+  function isAttachDisabled() {
+    // 流活跃或 steer 模式时禁用 attach (与 send 同纲领)
+    return streamSteerActive || ($send.dataset.mode === 'steer');
+  }
+
+  function renderAttachedImages() {
+    $attachedImages.innerHTML = '';
+    attachedImages.forEach((url, idx) => {
+      const div = document.createElement('div');
+      div.className = 'thumb';
+      const img = document.createElement('img');
+      img.src = url;
+      img.alt = `附图 ${idx + 1}`;
+      const rm = document.createElement('button');
+      rm.className = 'rm';
+      rm.textContent = '✖';
+      rm.title = '移除';
+      rm.addEventListener('click', () => {
+        attachedImages.splice(idx, 1);
+        renderAttachedImages();
+      });
+      div.appendChild(img);
+      div.appendChild(rm);
+      $attachedImages.appendChild(div);
+    });
+  }
+
+  async function attachImages(files) {
+    if (isAttachDisabled()) return;
+    if (!files || !files.length) return;
+    for (const file of files) {
+      // 数量兜底校验放在 push 前, 防止异步 race 导致超 3
+      if (attachedImages.length >= MAX_IMAGES) {
+        showToast(`最多附带 ${MAX_IMAGES} 张图片`, true);
+        break;
+      }
+      if (!file.type || !file.type.startsWith('image/')) {
+        showToast(`仅支持图片: ${file.name}`, true);
+        continue;
+      }
+      if (file.size > MAX_IMAGE_SIZE) {
+        showToast(`图片过大 (>5MB): ${file.name}`, true);
+        continue;
+      }
+      try {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(reader.error || new Error('FileReader 失败'));
+          reader.readAsDataURL(file);
+        });
+        if (attachedImages.length < MAX_IMAGES) {
+          attachedImages.push(dataUrl);
+        }
+      } catch (e) {
+        showToast(`读取失败: ${file.name}`, true);
+      }
+    }
+    renderAttachedImages();
+  }
+
+  // 三路输入汇入:点击 / 拖拽 / 粘贴
+  $attach.addEventListener('click', () => {
+    if (isAttachDisabled()) return;
+    $fileInput.click();
+  });
+  $fileInput.addEventListener('change', (e) => {
+    attachImages(e.target.files);
+    e.target.value = ''; // 清 value 保证同一文件可重选
+  });
+  $inputBar.addEventListener('dragover', (e) => {
+    if (isAttachDisabled()) return;
+    e.preventDefault();
+    $inputBar.classList.add('drag-over');
+  });
+  $inputBar.addEventListener('dragleave', () => {
+    $inputBar.classList.remove('drag-over');
+  });
+  $inputBar.addEventListener('drop', (e) => {
+    e.preventDefault();
+    $inputBar.classList.remove('drag-over');
+    if (isAttachDisabled()) return;
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+      attachImages(e.dataTransfer.files);
+    }
+  });
+  document.addEventListener('paste', (e) => {
+    if (isAttachDisabled()) return;
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    const files = [];
+    for (const it of items) {
+      if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) attachImages(files);
+  });
+
   async function send() {
     const text = $input.value.trim();
-    if (!text || !canStartStream('聊天')) return;
+    if (!text && !attachedImages.length) return;
+    // Phase 9a: 流活跃 + steer 模式 → POST /api/steer (steer 仅文本, 不带图)
+    if ($send.dataset.mode === 'steer' && streamSteerActive) {
+      if (!text) { showToast('纠偏指令不能为空', true); return; }
+      return sendSteer(text);
+    }
+    if (!canStartStream('聊天')) return;
     if (!SESSION_ID) { showToast('会话未就绪,请稍候', true); return; }
+
+    // Phase 10a: 发送瞬间快照 images, 然后立即清空本地状态防止重发
+    const imagesSnapshot = attachedImages.slice();
+    attachedImages = [];
+    renderAttachedImages();
 
     const context = collectContext();
     clearUiHint();
-    addMessage('user', escapeHtml(text).replace(/\n/g, '<br>'), text);
+    // 用户气泡: 文本 + 缩略图条 (展示用)
+    const userHtml = text ? escapeHtml(text).replace(/\n/g, '<br>') : '';
+    const userBubble = addMessage('user', userHtml, text || '[图片]');
+    if (imagesSnapshot.length) {
+      const stripe = document.createElement('div');
+      stripe.className = 'attached-images';
+      // 直接复用 .attached-images CSS, 但在 user 气泡内部展示, 加 margin-top
+      stripe.style.padding = '6px 0 0';
+      imagesSnapshot.forEach((url, idx) => {
+        const div = document.createElement('div');
+        div.className = 'thumb';
+        const img = document.createElement('img');
+        img.src = url;
+        img.alt = `附图 ${idx + 1}`;
+        div.appendChild(img);
+        stripe.appendChild(div);
+      });
+      userBubble.appendChild(stripe);
+    }
     $input.value = '';
     autoResize();
     setStreaming(true);
 
     const ctx = createAiStreamContext();
     try {
+      const body = { session_id: SESSION_ID, message: text, context };
+      if (imagesSnapshot.length) body.images = imagesSnapshot;
       const resp = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: SESSION_ID, message: text, context }),
+        body: JSON.stringify(body),
       });
-      if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
+      if (!resp.ok || !resp.body) {
+        // Phase 10a: 尝试读 detail (后端 ImagePayloadInvalid 等 400 返回结构化错误)
+        let detail = `HTTP ${resp.status}`;
+        try {
+          const errJson = await resp.json();
+          if (errJson && errJson.detail) detail = errJson.detail;
+        } catch (_) {}
+        throw new Error(detail);
+      }
       await consumeStream(resp.body.getReader(), ctx);
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
@@ -2303,7 +2937,39 @@
     }
   }
 
-  async function sendUiAction(surfaceId, comp, btn) {
+  // Phase 9a: 发送纠偏指令到 /api/steer。立即返回, 不启 SSE 流;
+  // 本地在聊天区追加一个 user-style "纠偏" 气泡作为视觉反馈, 实际生效由
+  // 当前流的下一轮 steer_applied 事件确认 (consumeStream 会插一条 system note)。
+  async function sendSteer(message) {
+    if (!SESSION_ID) { showToast('会话未就绪', true); return; }
+    $input.value = '';
+    autoResize();
+    addMessage('user', `<span class="steer-tag">[纠偏]</span> ${escapeHtml(message).replace(/\n/g, '<br>')}`, `[纠偏] ${message}`);
+    try {
+      const resp = await fetch('/api/steer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: SESSION_ID, message }),
+      });
+      if (!resp.ok) {
+        let detail = `HTTP ${resp.status}`;
+        try {
+          const data = await resp.json();
+          if (data && data.detail) detail = String(data.detail);
+        } catch (_) { /* ignore */ }
+        showToast('Steer 失败: ' + detail, true);
+        return;
+      }
+      showToast('已发送纠偏指令,下一轮生效', false);
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      showToast('Steer 网络错误: ' + msg, true);
+    } finally {
+      $input.focus();
+    }
+  }
+
+  async function sendUiAction(surfaceId, comp, btn, surface) {
     if (!SESSION_ID) { showToast('会话未就绪,无法执行 action', true); return; }
     if (!canStartStream('UI action')) return;
     const action = comp && comp.action && typeof comp.action === 'object' ? comp.action : null;
@@ -2327,6 +2993,9 @@
           surface_id: surfaceId,
           component_id: comp.id,
           event_name: eventName,
+          // Phase 8b: 表单数据快照 —— 让模型直接读取用户填写的表单字段。
+          // surface 可能为空(老的不传 surface 的 button 调用兼容);后端字段也是 Optional。
+          form_data: (surface && surface.data) ? surface.data : {},
         }),
       });
       if (!resp.ok || !resp.body) {
@@ -2622,7 +3291,8 @@
     div.className = 'msg hitl';
     const header = document.createElement('div');
     header.className = 'hitl-header';
-    header.textContent = '计划步骤需要处理';
+    header.textContent = (payload.error_message && payload.error_message.includes('中断'))
+      ? '计划因服务重启被中断' : '计划步骤需要处理';
     div.appendChild(header);
 
     const msg = document.createElement('div');
@@ -2633,6 +3303,12 @@
     const editor = buildEditablePlanSteps(payload.steps || []);
     div.appendChild(editor);
 
+    // Phase 7a M3: 为 update 操作添加编辑指引
+    const hint = document.createElement('span');
+    hint.style.cssText = 'color:#999;font-size:12px;display:block;margin-bottom:6px';
+    hint.textContent = '请先编辑步骤，然后点击确认';
+    div.appendChild(hint);
+
     const actions = document.createElement('div');
     actions.className = 'hitl-actions';
     const makeBtn = (label, decision) => {
@@ -2642,13 +3318,31 @@
       btn.textContent = label;
       btn.addEventListener('click', () => {
         if (!canStartStream('计划恢复')) return;
-        markHitlResolved(div, label);
-        consumePlanDecisionStream({
-          plan_id: payload.plan_id,
-          step_id: payload.step_id,
-          decision,
-          steps: decision === 'update' ? collectPlanSteps(editor) : null,
-        });
+        if (decision === 'update') {
+          // Phase 7a M3: update 操作延迟 markHitlResolved,保留编辑器可编辑
+          actions.querySelectorAll('button').forEach(b => { b.disabled = true; });
+          hint.textContent = '正在提交修改...';
+          consumePlanDecisionStream({
+            plan_id: payload.plan_id,
+            step_id: payload.step_id,
+            decision,
+            steps: collectPlanSteps(editor),
+          }).then(() => {
+            markHitlResolved(div, '已修改');
+          }).catch(() => {
+            // 失败时恢复按钮
+            actions.querySelectorAll('button').forEach(b => { b.disabled = false; });
+            hint.textContent = '提交失败，请重试';
+          });
+        } else {
+          markHitlResolved(div, label);
+          consumePlanDecisionStream({
+            plan_id: payload.plan_id,
+            step_id: payload.step_id,
+            decision,
+            steps: null,
+          });
+        }
       });
       return btn;
     };
@@ -2872,7 +3566,20 @@
   });
 
   // ---------- 首屏初始化 ----------
+  async function fetchHealth() {
+    // Phase 9a + Step 10: 从 /api/health 读 api_mode, 决定 steerable 默认值
+    try {
+      const resp = await fetch('/api/health');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data && typeof data.api_mode === 'string') {
+        API_MODE_CACHE = data.api_mode;
+      }
+    } catch (e) { /* keep default 'chat' */ }
+  }
+
   async function init() {
+    await fetchHealth();
     const stored = localStorage.getItem('sid');
     if (stored) {
       SESSION_ID = stored;

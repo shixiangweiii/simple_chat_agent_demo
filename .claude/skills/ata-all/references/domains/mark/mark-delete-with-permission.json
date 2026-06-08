@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "id": "ata::mark-delete-with-permission",
+  "description": "取消收藏指定内容",
+  "javaMethod": "com.alibaba.atasuper.client.v2.mark.MarkClientService#deleteWithPermission",
+  "inputSchema": {
+    "description": "取消收藏指定内容",
+    "properties": {
+      "fieldName_0": {
+        "description": "取消收藏参数",
+        "properties": {
+          "oidList": {
+            "items": {
+              "description": "收藏对象id",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "type": {
+            "description": "收藏对象类型;1 文章;（MarkTypeEnum，与 Java Byte 一致）",
+            "type": "number"
+          }
+        },
+        "required": [
+          "type",
+          "oidList"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "fieldName_0"
+    ],
+    "type": "object"
+  },
+  "outputSchema": {
+    "description": "AtaActionResult 操作结果",
+    "type": "object",
+    "properties": {
+      "success": {
+        "type": "boolean",
+        "description": "是否成功"
+      },
+      "errorCode": {
+        "type": "string",
+        "description": "错误编码"
+      },
+      "errorMsg": {
+        "type": "string",
+        "description": "错误信息"
+      },
+      "traceId": {
+        "type": "string",
+        "description": "追踪id"
+      }
+    }
+  }
+}

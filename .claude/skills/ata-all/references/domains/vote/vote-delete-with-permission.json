@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "id": "ata::vote-delete-with-permission",
+  "description": "取消点赞指定内容",
+  "javaMethod": "com.alibaba.atasuper.client.v2.vote.VoteClientService#deleteWithPermission",
+  "inputSchema": {
+    "description": "取消点赞指定内容",
+    "properties": {
+      "fieldName_0": {
+        "description": "取消点赞参数",
+        "properties": {
+          "objId": {
+            "description": "取消点赞对象id",
+            "type": "number"
+          },
+          "type": {
+            "description": "取消对象类型;1 文章；",
+            "type": "number"
+          }
+        },
+        "required": [
+          "objId",
+          "type"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "fieldName_0"
+    ],
+    "type": "object"
+  },
+  "outputSchema": {
+    "description": "AtaActionResult 操作结果",
+    "type": "object",
+    "properties": {
+      "success": {
+        "type": "boolean",
+        "description": "是否成功"
+      },
+      "errorCode": {
+        "type": "string",
+        "description": "错误编码"
+      },
+      "errorMsg": {
+        "type": "string",
+        "description": "错误信息"
+      },
+      "traceId": {
+        "type": "string",
+        "description": "追踪id"
+      }
+    }
+  }
+}

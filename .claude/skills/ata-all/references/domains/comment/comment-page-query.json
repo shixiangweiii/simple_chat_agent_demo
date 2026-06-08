@@ -1,0 +1,283 @@
+{
+  "version": 1,
+  "id": "ata::comment-page-query",
+  "description": "查询指定内容的评论列表",
+  "javaMethod": "com.alibaba.atasuper.client.v2.comment.CommentClientService#pageQuery",
+  "inputSchema": {
+    "description": "查询指定内容的评论列表",
+    "properties": {
+      "fieldName_0": {
+        "description": "查询评论的参数",
+        "properties": {
+          "currentPage": {
+            "description": "当前页码",
+            "type": "number"
+          },
+          "enableReturnCount": {
+            "description": "是否返回总条数",
+            "type": "boolean"
+          },
+          "orderByList": {
+            "description": "排序的字段信息",
+            "items": {
+              "description": "排序的字段信息",
+              "properties": {
+                "direction": {
+                  "description": "排序;ASC 顺序;DESC 倒序;",
+                  "enum": [
+                    "ASC",
+                    "DESC"
+                  ],
+                  "type": "string"
+                },
+                "orderConditionName": {
+                  "description": "排序字段名;ID 主键;ACCEPTED 是否采纳;EXPRESSIONCOUNT 观点数量;",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "orderConditionName",
+                "direction"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pageSize": {
+            "description": "分页大小",
+            "type": "number"
+          },
+          "pid": {
+            "description": "评论对象的id",
+            "type": "number"
+          },
+          "source": {
+            "description": "评论对象;11 文章;",
+            "type": "number"
+          },
+          "userId": {
+            "description": "ATA用户id,一般是11或12开头的11位数字。`user-comprehensive-page-query`可以把花名、姓名、工号转成用户id",
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "fieldName_1": {
+        "description": "返回字段的选择器，可以返回一些额外字段，在选择器中没有的字段默认这个接口都会直接返回的，在用户没有特别说明的情况下选择器建议不传任何字段",
+        "properties": {
+          "replyList": {
+            "description": "回复列表",
+            "type": "boolean"
+          },
+          "replySelector": {
+            "description": "选择replyList对象里面的字段",
+            "properties": {
+              "user": {
+                "description": "用户",
+                "type": "boolean"
+              },
+              "withBlobs": {
+                "description": "是否返回评论内容",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "user": {
+            "description": "用户信息",
+            "type": "boolean"
+          },
+          "withBlobs": {
+            "description": "是否返回评论内容",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "required": [
+      "fieldName_0"
+    ],
+    "type": "object"
+  },
+  "outputSchema": {
+    "description": "AtaPageResult<CommentClientDTO> 评论分页结果",
+    "type": "object",
+    "properties": {
+      "success": {
+        "type": "boolean",
+        "description": "是否成功"
+      },
+      "errorCode": {
+        "type": "string",
+        "description": "错误编码"
+      },
+      "errorMsg": {
+        "type": "string",
+        "description": "错误信息"
+      },
+      "traceId": {
+        "type": "string",
+        "description": "追踪id"
+      },
+      "content": {
+        "type": "object",
+        "description": "分页数据",
+        "properties": {
+          "data": {
+            "type": "array",
+            "description": "评论列表",
+            "items": {
+              "$ref": "#/$defs/CommentClientDTO"
+            }
+          },
+          "totalCount": {
+            "type": "number",
+            "description": "总条数（需要 enableReturnCount=true 才会返回）"
+          },
+          "currentPage": {
+            "type": "number",
+            "description": "当前页码"
+          },
+          "pageSize": {
+            "type": "number",
+            "description": "分页大小"
+          }
+        }
+      }
+    },
+    "$defs": {
+      "CommentClientDTO": {
+        "type": "object",
+        "description": "评论",
+        "properties": {
+          "id": {
+            "type": "number",
+            "description": "评论id"
+          },
+          "pid": {
+            "type": "number",
+            "description": "存储对象id"
+          },
+          "source": {
+            "type": "number",
+            "description": "来源（DomainObJTypeEnum value）"
+          },
+          "content": {
+            "type": "string",
+            "description": "评论内容（需 withBlobs）"
+          },
+          "praise": {
+            "type": "number",
+            "description": "点赞数"
+          },
+          "replyList": {
+            "type": "array",
+            "description": "回复列表",
+            "items": {
+              "$ref": "#/$defs/ReplyClientDTO"
+            }
+          },
+          "replycount": {
+            "type": "number",
+            "description": "回复数"
+          },
+          "userId": {
+            "type": "number",
+            "description": "用户id"
+          },
+          "user": {
+            "$ref": "#/$defs/DomainUserClientDTO",
+            "description": "用户信息（需 selector）"
+          },
+          "createTime": {
+            "type": "string",
+            "description": "创建时间"
+          },
+          "floor": {
+            "type": "number",
+            "description": "楼层"
+          }
+        }
+      },
+      "ReplyClientDTO": {
+        "type": "object",
+        "description": "评论回复",
+        "properties": {
+          "id": {
+            "type": "number",
+            "description": "回复id"
+          },
+          "pid": {
+            "type": "number",
+            "description": "存储对象id"
+          },
+          "commentId": {
+            "type": "number",
+            "description": "父评论id"
+          },
+          "source": {
+            "type": "number",
+            "description": "来源"
+          },
+          "content": {
+            "type": "string",
+            "description": "内容（需 withBlobs）"
+          },
+          "praise": {
+            "type": "number",
+            "description": "点赞数"
+          },
+          "userId": {
+            "type": "number",
+            "description": "用户id"
+          },
+          "user": {
+            "$ref": "#/$defs/DomainUserClientDTO"
+          },
+          "createTime": {
+            "type": "string",
+            "description": "创建时间"
+          }
+        }
+      },
+      "DomainUserClientDTO": {
+        "type": "object",
+        "description": "用户信息",
+        "properties": {
+          "id": {
+            "type": "number",
+            "description": "用户id"
+          },
+          "workId": {
+            "type": "string",
+            "description": "用户工号"
+          },
+          "realname": {
+            "type": "string",
+            "description": "真实姓名"
+          },
+          "nickname": {
+            "type": "string",
+            "description": "花名"
+          },
+          "deptNo": {
+            "type": "string",
+            "description": "员工部门编号"
+          },
+          "showDepartment": {
+            "type": "string",
+            "description": "部门名称，用于前端展示"
+          }
+        },
+        "required": [
+          "id",
+          "workId",
+          "realname",
+          "nickname",
+          "deptNo"
+        ]
+      }
+    }
+  }
+}

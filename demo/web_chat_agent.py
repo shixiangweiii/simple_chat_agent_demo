@@ -32,12 +32,14 @@ from chat_core import (  # noqa: E402
     HistoryNotFound,
     InvalidSessionId,
     MODEL,
+    API_MODE,
     PendingMismatch,
     PendingNotFound,
     PlanNotFound,
     PlanStateMismatch,
     PlanUnavailable,
     PlanValidationError,
+    SteerUnavailable,
     UiActionMismatch,
     UiActionNotFound,
     UiActionUnavailable,
@@ -47,7 +49,9 @@ from chat_core import (  # noqa: E402
     delete_session,
     get_archive_path_if_exists,
     get_or_load,
+    get_session_lock,
     list_sessions,
+    _with_protocol_tags,
     plan_confirm_response,
     plan_continue_response,
     plan_decision_response,
@@ -56,6 +60,7 @@ from chat_core import (  # noqa: E402
     resume_chat_response,
     runtime_state_snapshot,
     session_count,
+    steer_response,
     stream_agent_response,
     ui_action_response,
 )
@@ -88,6 +93,44 @@ app = FastAPI(title="Simple Chat Agent")
 
 
 # ============================================================
+# Phase 10a: 多模态图片上传限制 (HTTP 边界, 不放 chat_core)
+# ============================================================
+# 单张原图 ≤ 5MB,base64 编码后膨胀 4/3,留 data URL 头部余量,约 ~7.5MB 字符
+MAX_IMAGES_PER_TURN = 3
+MAX_IMAGE_DATA_URL_CHARS = 7_500_000
+
+
+class ImagePayloadInvalid(ValueError):
+    """前端送来的 images 字段不通过后端硬校验。HTTP 层翻译为 400。
+
+    校验规则(与前端 attachImages 双层防御):
+    - 总数 ≤ MAX_IMAGES_PER_TURN
+    - 每条必须 str 且 startswith("data:image/")(白名单 image/*)
+    - 每条字符长度 ≤ MAX_IMAGE_DATA_URL_CHARS(约 5MB 原图编码后上限)
+    """
+
+
+def _validate_images(images: list[str] | None) -> list[str] | None:
+    """校验并归一化 images 字段。None / [] 都返回 None,让下游短路。"""
+    if not images:
+        return None
+    if len(images) > MAX_IMAGES_PER_TURN:
+        raise ImagePayloadInvalid(
+            f"最多附带 {MAX_IMAGES_PER_TURN} 张图片(收到 {len(images)} 张)"
+        )
+    for idx, item in enumerate(images):
+        if not isinstance(item, str) or not item.startswith("data:image/"):
+            raise ImagePayloadInvalid(
+                f"第 {idx + 1} 张图片格式非法,必须是 data:image/* 起始的 data URL"
+            )
+        if len(item) > MAX_IMAGE_DATA_URL_CHARS:
+            raise ImagePayloadInvalid(
+                f"第 {idx + 1} 张图片过大,请压缩到 5MB 以内"
+            )
+    return images
+
+
+# ============================================================
 # 请求体模型
 # ============================================================
 
@@ -101,6 +144,8 @@ class ChatRequest(BaseModel):
     session_id: str
     message: str
     context: ChatContext | None = None
+    # Phase 10a: 可选图片附件 base64 data URL list, 详见 _validate_images 校验
+    images: list[str] | None = None
 
 
 class ResetRequest(BaseModel):
@@ -129,6 +174,9 @@ class UiActionRequest(BaseModel):
     surface_id: str
     component_id: str
     event_name: str
+    # Phase 8b: 表单数据快照 —— 前端 sendUiAction 会带上当前 surface.data,
+    # 后端 ui_action_response 注入到 [UI Action] 文本供模型读取。可选,兼容旧客户端。
+    form_data: dict | None = None
 
 
 class PlanConfirmRequest(BaseModel):
@@ -156,6 +204,12 @@ class ConfidenceDecisionRequest(BaseModel):
     decision: Literal["accept", "discard"]
 
 
+class SteerRequest(BaseModel):
+    """Phase 9a: 用户在 Agent 流活跃期间发起的方向纠正指令。"""
+    session_id: str
+    message: str
+
+
 # ============================================================
 # SSE 序列化
 # ============================================================
@@ -167,9 +221,12 @@ def sse(event: str, data: dict) -> str:
 async def _sse_stream(
     events: AsyncGenerator[tuple[str, dict], None],
 ) -> AsyncGenerator[str, None]:
-    """把 chat_core 抛出的 (event_name, payload) 元组逐个套上 SSE 文本帧。"""
+    """把 chat_core 抛出的 (event_name, payload) 元组逐个套上 SSE 文本帧。
+
+    Phase 7b: 通过 _with_protocol_tags 注入 AG-UI/A2UI 协议标签字段。
+    """
     async for event_name, payload in events:
-        yield sse(event_name, payload)
+        yield sse(event_name, _with_protocol_tags(event_name, payload))
 
 
 # ============================================================
@@ -183,7 +240,7 @@ async def index() -> FileResponse:
 
 @app.get("/api/health")
 async def health() -> dict:
-    return {"ok": True, "model": MODEL, "sessions": session_count()}
+    return {"ok": True, "model": MODEL, "api_mode": API_MODE, "sessions": session_count()}
 
 
 @app.get("/api/runtime_state")
@@ -209,9 +266,23 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         context = req.context.model_dump(exclude_none=True)
     else:
         context = req.context.dict(exclude_none=True)
-    events = stream_agent_response(memory, req.message, request.is_disconnected, req.session_id, context)
+    # Phase 10a: 图片 payload 后端硬校验(前端 attachImages 也做, 双层防御)
+    try:
+        images = _validate_images(req.images)
+    except ImagePayloadInvalid as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    events = stream_agent_response(
+        memory, req.message, request.is_disconnected, req.session_id, context, images,
+    )
+    lock = get_session_lock(req.session_id)
+
+    async def _locked():
+        async with lock:
+            async for chunk in _sse_stream(events):
+                yield chunk
+
     return StreamingResponse(
-        _sse_stream(events),
+        _locked(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -237,8 +308,15 @@ async def resume(req: ResumeRequest, request: Request) -> StreamingResponse:
         raise HTTPException(status_code=404, detail="no pending HITL for session")
     except PendingMismatch:
         raise HTTPException(status_code=409, detail="tool_call_id mismatch")
+    lock = get_session_lock(req.session_id)
+
+    async def _locked():
+        async with lock:
+            async for chunk in _sse_stream(events):
+                yield chunk
+
     return StreamingResponse(
-        _sse_stream(events),
+        _locked(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -254,6 +332,7 @@ async def ui_action(req: UiActionRequest, request: Request) -> StreamingResponse
             req.component_id,
             req.event_name,
             request.is_disconnected,
+            form_data=req.form_data,
         )
     except InvalidSessionId:
         raise HTTPException(status_code=400, detail="invalid session_id")
@@ -265,8 +344,15 @@ async def ui_action(req: UiActionRequest, request: Request) -> StreamingResponse
         raise HTTPException(status_code=404, detail="ui action not found")
     except UiActionMismatch:
         raise HTTPException(status_code=409, detail="ui action mismatch")
+    lock = get_session_lock(req.session_id)
+
+    async def _locked():
+        async with lock:
+            async for chunk in _sse_stream(events):
+                yield chunk
+
     return StreamingResponse(
-        _sse_stream(events),
+        _locked(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -292,8 +378,15 @@ async def plan_confirm(req: PlanConfirmRequest, request: Request) -> StreamingRe
         raise HTTPException(status_code=404, detail="plan not found")
     except PlanStateMismatch:
         raise HTTPException(status_code=409, detail="plan state mismatch")
+    lock = get_session_lock(req.session_id)
+
+    async def _locked():
+        async with lock:
+            async for chunk in _sse_stream(events):
+                yield chunk
+
     return StreamingResponse(
-        _sse_stream(events),
+        _locked(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -321,8 +414,15 @@ async def plan_decision(req: PlanDecisionRequest, request: Request) -> Streaming
         raise HTTPException(status_code=404, detail="plan not found")
     except PlanStateMismatch:
         raise HTTPException(status_code=409, detail="plan state mismatch")
+    lock = get_session_lock(req.session_id)
+
+    async def _locked():
+        async with lock:
+            async for chunk in _sse_stream(events):
+                yield chunk
+
     return StreamingResponse(
-        _sse_stream(events),
+        _locked(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -347,8 +447,15 @@ async def plan_continue(req: PlanContinueRequest, request: Request) -> Streaming
         raise HTTPException(status_code=404, detail="plan not found")
     except PlanStateMismatch:
         raise HTTPException(status_code=409, detail="plan state mismatch")
+    lock = get_session_lock(req.session_id)
+
+    async def _locked():
+        async with lock:
+            async for chunk in _sse_stream(events):
+                yield chunk
+
     return StreamingResponse(
-        _sse_stream(events),
+        _locked(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -363,6 +470,23 @@ async def confidence_decision_route(req: ConfidenceDecisionRequest) -> dict:
         raise HTTPException(status_code=400, detail="invalid session_id")
     except DraftNotFound:
         raise HTTPException(status_code=404, detail="draft not found")
+
+
+@app.post("/api/steer")
+async def steer_route(req: SteerRequest) -> dict:
+    """Phase 9a: 用户在 Agent 流活跃期间注入纠偏指令。
+
+    本路由**不获取** session lock —— 否则与正在持有锁的 SSE 流死锁。
+    仅做参数校验 + put 到内存队列, 立即返回。下一轮 ReAct LLM 调用前被消费。
+
+    若无活跃流, steer 进入队列等待下次 /api/chat。
+    """
+    try:
+        return steer_response(req.session_id, req.message)
+    except InvalidSessionId:
+        raise HTTPException(status_code=400, detail="invalid session_id")
+    except SteerUnavailable as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/reset")

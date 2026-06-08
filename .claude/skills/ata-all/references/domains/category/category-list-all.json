@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "id": "ata::category-list-all",
+  "description": "查询知识体系或文章类型的标签全量列表（入参 `cid`：1 为知识体系，2 为文章类型，见 schema）。可先匹配标签 id，再在 `article-comprehensive-page-query` 等接口中使用。",
+  "javaMethod": "com.alibaba.atasuper.client.v2.category.AtaCategoryContentClientService#listAllFromCache",
+  "inputSchema": {
+    "description": "查询知识体系或文章类型的标签全量列表（入参 `cid`：1 为知识体系，2 为文章类型，见 schema）。可先匹配标签 id，再在 `article-comprehensive-page-query` 等接口中使用。",
+    "properties": {
+      "fieldName_0": {
+        "description": "查询知识体系参数",
+        "properties": {
+          "cid": {
+            "description": "类别id 知识体系:1 文章类型:2",
+            "type": "number"
+          }
+        },
+        "required": [
+          "cid"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "fieldName_0"
+    ],
+    "type": "object"
+  },
+  "outputSchema": {
+    "description": "AtaListResult<AtaCategoryContentClientDTO> 标签列表结果",
+    "type": "object",
+    "properties": {
+      "success": {
+        "type": "boolean",
+        "description": "是否成功"
+      },
+      "errorCode": {
+        "type": "string",
+        "description": "错误编码"
+      },
+      "errorMsg": {
+        "type": "string",
+        "description": "错误信息"
+      },
+      "traceId": {
+        "type": "string",
+        "description": "追踪id"
+      },
+      "content": {
+        "type": "array",
+        "description": "标签列表",
+        "items": {
+          "$ref": "#/$defs/AtaCategoryContentClientDTO"
+        }
+      }
+    },
+    "$defs": {
+      "AtaCategoryContentClientDTO": {
+        "type": "object",
+        "description": "文章标签",
+        "properties": {
+          "id": {
+            "type": "number",
+            "description": "主键"
+          },
+          "cid": {
+            "type": "number",
+            "description": "类别id：1 知识体系 / 2 文章类型"
+          },
+          "parentId": {
+            "type": "number",
+            "description": "父类别Id"
+          },
+          "name": {
+            "type": "string",
+            "description": "类别名称"
+          },
+          "children": {
+            "type": "array",
+            "description": "子标签",
+            "items": {
+              "$ref": "#/$defs/AtaCategoryContentClientDTO"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ]
+      }
+    }
+  }
+}

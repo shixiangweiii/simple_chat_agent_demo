@@ -59,6 +59,9 @@ PLAN_STEP_MAX_ROUNDS = 3
 CONFIDENCE_LOW_THRESHOLD = 0.55
 CONFIDENCE_MEDIUM_THRESHOLD = 0.8
 CONFIDENCE_REASON_MAX_CHARS = 240
+# Phase 7a: 尾部缓冲上限,超过此长度立即 flush,防止短答案被完整缓冲。
+# 略大于 CONFIDENCE_REASON_MAX_CHARS + marker 开销(~60)。
+_CONFIDENCE_TAIL_MAX = 300
 
 
 # ============================================================
@@ -265,8 +268,17 @@ RENDER_UI_TOOL: dict = {
                     "type": "array",
                     "description": (
                         "扁平组件列表,通过 children 数组引用构建树;必须包含 id='root' 的根节点。"
-                        "支持 type: text/card/row/column/table/button。button 可带 "
-                        "action: {event_name, context?} 供前端点击后回传。"
+                        "支持 type: text/card/row/column/table/button,以及表单组件 "
+                        "text_field/select/toggle。button 可带 action: {event_name, context?} "
+                        "供前端点击后回传。"
+                        "表单组件 schema: "
+                        "text_field {id, type:'text_field', value_path, label?, placeholder?, "
+                        "input_type?:'shortText'|'longText'|'number'};"
+                        "select {id, type:'select', value_path, options:[{label,value}], "
+                        "label?, multiple?};"
+                        "toggle {id, type:'toggle', value_path, label?}。"
+                        "表单字段的 value_path 是 JSON Pointer,绑定到 surface.data;"
+                        "用户提交按钮时,前端会把 surface.data 整体作为 form_data 回传。"
                     ),
                     "items": {
                         "type": "object",
@@ -275,7 +287,19 @@ RENDER_UI_TOOL: dict = {
                 },
                 "data": {
                     "type": "object",
-                    "description": "可选数据对象,table.rows_path 与 text.path 可用 JSON Pointer 引用。",
+                    "description": (
+                        "可选数据对象;表单组件的 value_path 也可用此初始化默认值,"
+                        "table.rows_path 与 text.path 用 JSON Pointer 引用。"
+                    ),
+                },
+                "complete": {
+                    "type": "boolean",
+                    "description": (
+                        "true=一次性完整渲染(默认,覆盖语义);"
+                        "false=流式增量(多次调用按 id 合并到同一 surface,"
+                        "最后一次发出后前端见 begin_rendering 信号确认渲染完成)。"
+                    ),
+                    "default": True,
                 },
             },
             "required": ["surface_id", "components"],
@@ -325,7 +349,7 @@ USER_PROMPT = """# 角色设定
 2. **内置联网搜索**：系统已为你接入联网搜索能力。当用户询问天气、新闻、股价、近期事件等需要实时信息的问题，或你不确定的事实性问题时，请获取最新信息并基于搜索结果作答；**不要**输出 Thought/Action 文本，也不要回复"无法获取实时数据"；
 3. **澄清提问**：当用户问题关键信息不足（语言/版本/范围/偏好等）时，调用 `ask_user` 工具向用户索取具体信息，可在 `options` 中给出推荐选项，**不要凭空假设**；
 4. **危险操作审批**：涉及执行命令、删除数据、修改系统等敏感动作时，调用 `execute_shell_command` 工具发起审批，**不要**直接回复"我无法执行"或自行假设结果；
-5. **声明式 UI**：当表格、对比卡片或按钮能让回答更清楚时，调用 `render_ui`；用户点击 UI 按钮后，如需刷新已有界面数据，调用 `update_ui_data`；
+5. **声明式 UI**：当表格、对比卡片、按钮或**表单（多字段输入）**能让回答更清楚时，调用 `render_ui`；表单字段（`text_field`/`select`/`toggle`）通过 `value_path`（JSON Pointer）绑定到 surface 的 `data`，用户点击按钮提交时表单数据会一并回传给你；如需刷新已有界面数据，调用 `update_ui_data`；
 6. **协作式计划**：当任务明显需要多个步骤或用户确认执行顺序时，调用 `create_plan` 提交计划给用户审阅；计划确认后再逐步执行；
 7. 当下方"工具列表"中有自定义工具时，按 Thought/Action/Observation 协议调用；
 8. 既不需要联网也不需要自定义工具时，直接给出清晰、有帮助的回复。
@@ -431,6 +455,114 @@ _RUNTIME_RESTORED: set[str] = set()
 _ANSWER_DRAFTS: dict[str, dict[str, dict]] = {}
 _DRAFT_SEQ = 0
 
+# Phase 7a M6: 并发流互斥。每个 session 一个 asyncio.Lock,防止多个 SSE 流同时操作共享状态。
+_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def get_session_lock(session_id: str) -> asyncio.Lock:
+    """返回(必要时创建)指定 session 的 asyncio.Lock。"""
+    if session_id not in _SESSION_LOCKS:
+        _SESSION_LOCKS[session_id] = asyncio.Lock()
+    return _SESSION_LOCKS[session_id]
+
+
+# ============================================================
+# Phase 9a Agent Steering —— 进程内 steer 队列 + 历史
+# ============================================================
+# 每个 session 一个 asyncio.Queue, 用户 POST /api/steer 时入队,
+# _stream_react_rounds / _stream_plan_step_rounds 在轮次边界 drain。
+#
+# 设计要点:
+# - 不持久化(进程退出后未消费的 steer 无意义, 不写 runtime sidecar);
+# - 懒创建在消费侧首次访问时, 生产侧用同一 accessor, 保证 Queue 绑定到唯一事件循环;
+# - 单 turn drain 是非阻塞的, 不会卡住 ReAct loop;
+# - 历史只为前端 agent_state_snapshot/delta 展示,固定上限防爆;
+# - 不获取 _SESSION_LOCKS —— 否则与活跃 SSE 流死锁。
+_STEER_QUEUES: dict[str, asyncio.Queue] = {}
+_STEER_HISTORY: dict[str, list[dict]] = {}
+_STEER_HISTORY_MAX = 10
+
+
+def get_steer_queue(session_id: str) -> asyncio.Queue:
+    """懒创建并返回指定 session 的 steer 队列。
+
+    生产侧 (POST /api/steer) 与消费侧 (_stream_react_rounds) 共用同一 accessor,
+    保证 asyncio.Queue 绑定到唯一事件循环 (FastAPI/uvicorn 单循环亦然)。
+    """
+    if session_id not in _STEER_QUEUES:
+        _STEER_QUEUES[session_id] = asyncio.Queue()
+    return _STEER_QUEUES[session_id]
+
+
+def _drain_steers(session_id: str) -> list[str]:
+    """非阻塞抽干指定 session 的 steer 队列, 返回所有累计 steer 消息(可能为空 list)。
+
+    在 _stream_react_rounds / _stream_plan_step_rounds 每轮顶部调用。
+    """
+    queue = _STEER_QUEUES.get(session_id)
+    if queue is None:
+        return []
+    drained: list[str] = []
+    while True:
+        try:
+            drained.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    return drained
+
+
+def _record_steer(session_id: str, message: str) -> None:
+    """把消费过的 steer 写入历史(供 agent_state_snapshot/delta 展示), 超上限丢最旧。"""
+    history = _STEER_HISTORY.setdefault(session_id, [])
+    history.append({
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "message": message,
+    })
+    if len(history) > _STEER_HISTORY_MAX:
+        del history[: len(history) - _STEER_HISTORY_MAX]
+
+
+def _can_append_user_message(messages: list[dict]) -> bool:
+    """检查 messages 末尾是否允许追加 role=user。
+
+    OpenAI 约束: 若末尾是带 tool_calls 的 assistant 消息, 下一条必须是 role=tool;
+    此时 steer 必须延后到 tool 消费完毕后再注入, 否则 LLM 会 400。
+    """
+    if not messages:
+        return True
+    last = messages[-1]
+    if last.get("role") == "assistant" and last.get("tool_calls"):
+        return False
+    return True
+
+
+# Phase 7b: AG-UI / A2UI 协议标签映射。
+# 在 SSE payload 中注入标准协议字段,前端不依赖(向后兼容),仅作标准对齐文档标记。
+_SSE_PROTOCOL_TAGS: dict[str, dict[str, str]] = {
+    "status":            {"ag_ui_type": "step_started"},
+    "chunk":             {"ag_ui_type": "text_message_content"},
+    "tool_call":         {"ag_ui_type": "tool_call_start"},
+    "tool_result":       {"ag_ui_type": "tool_call_end"},
+    "await_user":        {"ag_ui_type": "interrupt"},
+    "ui_surface_create": {"a2ui_type": "surfaceUpdate"},
+    "ui_surface_update": {"a2ui_type": "surfaceUpdate"},
+    "ui_data_update":    {"a2ui_type": "dataModelUpdate"},
+    "activity_snapshot": {"ag_ui_type": "state_snapshot"},
+    "activity_delta":    {"ag_ui_type": "state_delta"},
+    "done":              {"ag_ui_type": "run_finished"},
+    "error":             {"ag_ui_type": "run_error"},
+    # 无标准映射的事件: thinking, search_status, component_loading,
+    # render_component, component_error, confidence_signal, ui_hint, begin_rendering
+}
+
+
+def _with_protocol_tags(event_name: str, payload: dict) -> dict:
+    """将 AG-UI/A2UI 协议标签注入 SSE payload(非变异)。"""
+    tags = _SSE_PROTOCOL_TAGS.get(event_name)
+    if not tags:
+        return payload
+    return {**payload, **tags}
+
 
 class InvalidSessionId(ValueError):
     """session_id 不符合 UUID 形态。HTTP 层应翻译为 400。"""
@@ -483,6 +615,10 @@ class PlanValidationError(ValueError):
 
 class DraftNotFound(LookupError):
     """低置信度草稿不存在或已处理。HTTP 层应翻译为 404。"""
+
+
+class SteerUnavailable(ValueError):
+    """steer 不可用 —— 非 chat 模式 / session_id 非法 / message 为空。HTTP 层应翻译为 400。"""
 
 
 def _archive_path(session_id: str) -> Path:
@@ -548,20 +684,26 @@ def _delete_runtime_state(session_id: str) -> None:
 
 
 def _restore_runtime_state(session_id: str) -> None:
-    """按 session 懒恢复运行态。损坏或版本不兼容时忽略,不影响普通聊天。"""
+    """按 session 懒恢复运行态。损坏或版本不兼容时忽略,不影响普通聊天。
+
+    Phase 7a M7: _RUNTIME_RESTORED.add 移到函数末尾,避免部分失败后不再重试。
+    Phase 7a M4: running 状态的 plan 恢复为 paused,使其可被前端继续。
+    """
     if session_id in _RUNTIME_RESTORED:
         return
     path = _runtime_state_path(session_id)
-    _RUNTIME_RESTORED.add(session_id)
     if not path.exists():
+        _RUNTIME_RESTORED.add(session_id)
         return
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         logger.warning("runtime state 损坏,已忽略: %s", path, exc_info=True)
+        _RUNTIME_RESTORED.add(session_id)
         return
     if data.get("version") != RUNTIME_STATE_VERSION or data.get("session_id") != session_id:
         logger.warning("runtime state 版本或 session 不匹配,已忽略: %s", path)
+        _RUNTIME_RESTORED.add(session_id)
         return
 
     try:
@@ -585,7 +727,11 @@ def _restore_runtime_state(session_id: str) -> None:
                     "actions": surface.get("actions") if isinstance(surface.get("actions"), dict) else {},
                 }
                 if not safe_surface["actions"]:
-                    safe_surface["actions"] = _extract_ui_actions(components)
+                    try:
+                        safe_surface["actions"] = _extract_ui_actions(components)
+                    except Exception:
+                        logger.warning("ui_actions 提取失败,已跳过: %s", surface_id, exc_info=True)
+                        safe_surface["actions"] = {}
                 safe_surfaces[surface_id] = safe_surface
             if safe_surfaces:
                 _UI_SURFACES[session_id] = safe_surfaces
@@ -603,10 +749,21 @@ def _restore_runtime_state(session_id: str) -> None:
                 and isinstance(plan.get("status"), str)
             }
             if safe_plans:
+                # Phase 7a M4: 将 running 状态的 plan 恢复为 paused,
+                # 并将中断的步骤标记为 error,使其可被前端继续执行。
+                for plan in safe_plans.values():
+                    if plan.get("status") == "running":
+                        plan["status"] = "paused"
+                        for step in plan.get("steps", []):
+                            if isinstance(step, dict) and step.get("status") not in {"done", "skipped"}:
+                                step["status"] = "error"
+                                step.setdefault("error_message", "服务重启，步骤执行被中断")
+                                break  # 只标记第一个未完成步骤
                 _PLANS[session_id] = safe_plans
                 _sync_plan_seq_from(safe_plans)
     except Exception:
         logger.warning("runtime state 结构损坏,已忽略: %s", path, exc_info=True)
+    _RUNTIME_RESTORED.add(session_id)
 
 
 def _plan_runtime_snapshot(plan: dict) -> dict:
@@ -653,6 +810,44 @@ def runtime_state_snapshot(session_id: str) -> dict:
     }
 
 
+def _agent_state_payload(
+    session_id: str,
+    *,
+    round_num: int = 0,
+    tool_stats: dict | None = None,
+) -> dict:
+    """构造 agent_state_snapshot/delta 的 payload —— 面向运行时观察的 Agent 全局态纲要。
+
+    与 runtime_state_snapshot 的差异:
+        - runtime_state_snapshot: 面向页面恢复的"全量" (含 components / steps 详情)
+        - _agent_state_payload:   面向流式观察的"纲要" (含 round / tool_stats / steer_history 等
+                                  局部事件凑不出的全局态; 不重复发 components / steps 那些
+                                  已有自己 SSE 通道的重量级数据)
+    """
+    pending = _PENDING.get(session_id)
+    awaiting = pending.get("awaiting") if isinstance(pending, dict) else None
+    return {
+        "session_id": session_id,
+        "round": round_num,
+        "tool_stats": dict(tool_stats or {}),
+        "surfaces": [
+            {"surface_id": sid, "component_count": len(s.get("components") or [])}
+            for sid, s in (_UI_SURFACES.get(session_id) or {}).items()
+        ],
+        "plans": [
+            {
+                "plan_id": p.get("plan_id"),
+                "title": p.get("title"),
+                "status": p.get("status"),
+                "step_count": len(p.get("steps") or []),
+            }
+            for p in (_PLANS.get(session_id) or {}).values()
+        ],
+        "pending": awaiting if isinstance(awaiting, dict) else None,
+        "steer_history": list(_STEER_HISTORY.get(session_id) or []),
+    }
+
+
 def _read_meta(path: Path) -> dict:
     """只读文件头部连续的 HTML 注释行,返回元信息字典。遇到第一个空行即停。"""
     meta: dict = {}
@@ -685,8 +880,30 @@ def get_or_load(session_id: str) -> Memory:
     return mem
 
 
+def _cleanup_session_runtime(session_id: str) -> None:
+    """Phase 7a M5: 归档后清理已完成的 plan、已处理的 answer draft。保留 UI surfaces 和活跃 pending。"""
+    # 清理已完成的计划
+    session_plans = _PLANS.get(session_id)
+    if isinstance(session_plans, dict):
+        done_ids = [pid for pid, p in session_plans.items()
+                    if isinstance(p, dict) and p.get("status") in {"done", "completed"}]
+        for pid in done_ids:
+            session_plans.pop(pid, None)
+        if not session_plans:
+            _PLANS.pop(session_id, None)
+    # 清理已处理的草稿
+    _ANSWER_DRAFTS.pop(session_id, None)
+    # 更新或清理 sidecar
+    if session_id in _PLANS or session_id in _PENDING or session_id in _UI_SURFACES:
+        _save_runtime_state(session_id)
+    else:
+        _delete_runtime_state(session_id)
+
+
 def archive_session(session_id: str) -> dict:
     """覆盖式归档当前 session 的 Memory 到 markdown。空 Memory 跳过。
+
+    Phase 7a M5: 归档后清理已完成的 plan 和已处理的 answer draft。
 
     返回与 /api/archive 端点期望响应一致的 dict:
         - 空 Memory: {"ok": True, "skipped": True}
@@ -697,6 +914,7 @@ def archive_session(session_id: str) -> dict:
         return {"ok": True, "skipped": True}
     path = _archive_path(session_id)
     _atomic_write(path, memory.to_markdown(session_id))
+    _cleanup_session_runtime(session_id)
     return {"ok": True, "path": str(path)}
 
 
@@ -708,6 +926,10 @@ def reset_session(session_id: str) -> None:
     _PLANS.pop(session_id, None)
     _PENDING.pop(session_id, None)
     _ANSWER_DRAFTS.pop(session_id, None)
+    # Phase 9 fix B1: session_id 保留 + 复用时, 旧 steer 不应残留 ——
+    # 否则下次该 sid 的 /api/chat 第一轮顶部 drain 会把过期纠偏注入新对话。
+    _STEER_QUEUES.pop(session_id, None)
+    _STEER_HISTORY.pop(session_id, None)
     _delete_runtime_state(session_id)
     path = _archive_path(session_id)
     path.unlink(missing_ok=True)
@@ -722,6 +944,10 @@ def delete_session(session_id: str) -> None:
     _PLANS.pop(session_id, None)
     _PENDING.pop(session_id, None)
     _ANSWER_DRAFTS.pop(session_id, None)
+    # Phase 9 fix B1: 与 reset_session 同纲领;即便 session_id 通常不复用,
+    # 也避免进程内 dict 泄漏(_STEER_HISTORY 占内存)。
+    _STEER_QUEUES.pop(session_id, None)
+    _STEER_HISTORY.pop(session_id, None)
     _delete_runtime_state(session_id)
 
 
@@ -927,11 +1153,18 @@ _NATIVE_TOOLS_CACHE: list[dict] | None = None
 
 def _memory_to_messages(
     memory: Memory, system_prompt: str, user_input: str, adaptive_fragment: str = "",
+    images: list[str] | None = None,
 ) -> list[dict]:
     """把 flat-string Memory 转成 OpenAI Chat Completions messages 数组。
 
     仅用于 chat-mode-with-tools 路径。Memory 存储格式不变(仍是 role/msg 二元组)。
     角色映射: 用户 -> user, AI -> assistant; 不携带历史 tool_calls(单 turn 内才需要)。
+
+    Phase 10a: 若 `images` 非空, 把最后一条 user 节点的 content 从纯 str 改为
+    OpenAI vision content parts 数组 [{type:"text",...}, {type:"image_url",...}*N]。
+    历史 turn 的 content 保持 str (Memory 不存图, 自然只能是文本)。
+    `llm_client._llm_stream_chat_with_tools` 透传 messages 给 OpenAI SDK,
+    SDK 对 str/list 两种 content 都原生支持, 无需任何修改 —— 这是协议无感的优雅样本。
     """
     sys_content = system_prompt
     if adaptive_fragment:
@@ -940,7 +1173,13 @@ def _memory_to_messages(
     for m in memory.memories:
         role = "user" if m["role"] == Memory.USER else "assistant"
         messages.append({"role": role, "content": m["msg"]})
-    messages.append({"role": "user", "content": user_input})
+    if images:
+        user_content: list[dict] = [{"type": "text", "text": user_input}]
+        for url in images:
+            user_content.append({"type": "image_url", "image_url": {"url": url}})
+        messages.append({"role": "user", "content": user_content})
+    else:
+        messages.append({"role": "user", "content": user_input})
     return messages
 
 
@@ -999,13 +1238,23 @@ def _confidence_level(score: float) -> str:
 
 
 def _confidence_buffer_start(text: str) -> int | None:
-    """若 text 尾部正在形成 confidence marker,返回应暂存的起点。"""
+    """若 text 尾部正在形成 confidence marker,返回应暂存的起点。
+
+    Phase 7a 修复: 前缀门控 —— 只有当 candidate 至少为 "[c" 时才触发缓冲,
+    避免任意 "[" (如引用 "[1]") 误触。同时增加长度守卫,超过上限立即放弃。
+    """
     if not text:
         return None
     bracket = text.rfind("[")
     if bracket >= 0:
         candidate = text[bracket:].lower()
-        if candidate.startswith("[confidence") or "[confidence".startswith(candidate):
+        # 前缀门控: candidate 必须是 "[confidence..." 或 "[confidence" 的真前缀(至少 "[c")
+        if candidate.startswith("[confidence") or (
+            len(candidate) >= 2 and "[confidence".startswith(candidate)
+        ):
+            # 长度守卫: 尾部已超上限,放弃缓冲立即 flush
+            if len(text) - bracket > _CONFIDENCE_TAIL_MAX:
+                return None
             start = bracket
             while start > 0 and text[start - 1].isspace():
                 start -= 1
@@ -1019,10 +1268,16 @@ def _confidence_buffer_start(text: str) -> int | None:
 
 
 def _buffer_confidence_delta(tail: str, delta: str) -> tuple[str, str]:
-    """仅暂存疑似 confidence marker 的尾部,其余内容立即流式输出。"""
+    """仅暂存疑似 confidence marker 的尾部,其余内容立即流式输出。
+
+    Phase 7a: 增加长度守卫,如果尾部已超 _CONFIDENCE_TAIL_MAX 立即 flush 全部。
+    """
     combined = tail + delta
     start = _confidence_buffer_start(combined)
     if start is None:
+        return "", combined
+    # 长度守卫: 尾部超过上限,放弃缓冲立即 flush
+    if len(combined) - start > _CONFIDENCE_TAIL_MAX:
         return "", combined
     return combined[start:], combined[:start]
 
@@ -1040,6 +1295,10 @@ def _extract_confidence_signal(text: str, tool_stats: dict | None = None, user_i
         reason = (match.group("reason") or "model_self_assessed").strip() or "model_self_assessed"
     else:
         clean_text = (text or "").rstrip()
+        # Phase 7a M2: 二次清理 —— 如果尾部有未闭合的 [confidence 前缀,截掉
+        _leak = re.search(r"\[\s*confidence[:\s][^]]*$", clean_text)
+        if _leak:
+            clean_text = clean_text[:_leak.start()].rstrip()
         score = 0.7
         reason = "model_unspecified"
 
@@ -1178,7 +1437,7 @@ def _merge_updated_plan_steps(existing_steps: list[dict], incoming_steps: list[d
             step["status"] = "pending"
             step["error_message"] = None
             step["result_summary"] = None
-        elif isinstance(old, dict) and old.get("status") in {"done", "skipped"}:
+        elif isinstance(old, dict) and old.get("status") in {"done", "skipped", "running"}:
             step["status"] = old["status"]
             step["result_summary"] = old.get("result_summary")
             step["error_message"] = old.get("error_message")
@@ -1345,7 +1604,13 @@ def _build_component_props(tool_name: str, args: dict, result_text: str) -> dict
 # Declarative Generative UI — Phase 3
 # ============================================================
 
-_SUPPORTED_UI_COMPONENT_TYPES = {"text", "card", "row", "column", "table", "button"}
+_SUPPORTED_UI_COMPONENT_TYPES = {
+    "text", "card", "row", "column", "table", "button",
+    # Phase 8b: 表单组件
+    "text_field", "select", "toggle",
+}
+_FORM_UI_COMPONENT_TYPES = {"text_field", "select", "toggle"}
+_SUPPORTED_TEXT_FIELD_INPUT_TYPES = {"shortText", "longText", "number"}
 
 
 def _extract_ui_actions(components: list[dict]) -> dict[str, dict]:
@@ -1372,15 +1637,49 @@ def _extract_ui_actions(components: list[dict]) -> dict[str, dict]:
     return actions
 
 
-def _register_ui_surface(session_id: str, surface_id: str, components: list[dict], data: dict) -> None:
-    """注册 Phase 3b 内存态 surface。"""
+def _register_ui_surface(
+    session_id: str,
+    surface_id: str,
+    components: list[dict],
+    data: dict,
+    *,
+    merge: bool = False,
+) -> None:
+    """注册 Phase 3b 内存态 surface。
+
+    Phase 8a: 当 merge=True 且 surface 已存在,按 component.id 合并 components
+    (旧顺序在前,同 id 新覆盖旧,新 id 追加在后);data 浅合并(传入非空时);
+    actions 用合并后的 components 重新提取。merge=False 保持覆盖语义,
+    兼容 complete=true 一次性渲染。
+    """
     if not SESSION_ID_RE.match(session_id):
         raise InvalidSessionId(session_id)
-    _UI_SURFACES.setdefault(session_id, {})[surface_id] = {
-        "components": components,
-        "data": data,
-        "actions": _extract_ui_actions(components),
-    }
+    existing = _UI_SURFACES.get(session_id, {}).get(surface_id)
+    if merge and existing is not None:
+        # 旧 + 新 按 id 合并,保持顺序
+        merged_map: dict[str, dict] = {}
+        for comp in existing.get("components") or []:
+            if isinstance(comp, dict) and isinstance(comp.get("id"), str):
+                merged_map[comp["id"]] = comp
+        for comp in components:
+            if isinstance(comp, dict) and isinstance(comp.get("id"), str):
+                merged_map[comp["id"]] = comp
+        merged_components = list(merged_map.values())
+        # data 浅合并:仅当 incoming data 非空时合并
+        merged_data = dict(existing.get("data") or {})
+        if data:
+            merged_data.update(data)
+        _UI_SURFACES.setdefault(session_id, {})[surface_id] = {
+            "components": merged_components,
+            "data": merged_data,
+            "actions": _extract_ui_actions(merged_components),
+        }
+    else:
+        _UI_SURFACES.setdefault(session_id, {})[surface_id] = {
+            "components": components,
+            "data": data,
+            "actions": _extract_ui_actions(components),
+        }
     _save_runtime_state(session_id)
 
 
@@ -1402,8 +1701,13 @@ def _decode_json_pointer(path: str) -> list[str]:
     return [part.replace("~1", "/").replace("~0", "~") for part in path[1:].split("/")]
 
 
-def _json_pointer_set(data: dict, path: str, value) -> dict:
-    """按 JSON Pointer 写入 data。/ 表示整体替换,深路径要求父节点已存在。"""
+def _json_pointer_set(data: dict, path: str, value, *, auto_create: bool = False) -> dict:
+    """按 JSON Pointer 写入 data。/ 表示整体替换,深路径要求父节点已存在。
+
+    Phase 8b: auto_create=True 时,中间路径的 dict key 不存在则自动建 {};
+    数组索引仍要求已存在(语义不清,不自动建)。仅前端表单写回路径使用此模式;
+    模型主动 update_ui_data 仍走严格模式以保持契约。
+    """
     tokens = _decode_json_pointer(path)
     if not tokens:
         if not isinstance(value, dict):
@@ -1414,7 +1718,10 @@ def _json_pointer_set(data: dict, path: str, value) -> dict:
     for token in tokens[:-1]:
         if isinstance(cur, dict):
             if token not in cur:
-                raise ValueError(f"path 父节点不存在: {token}")
+                if auto_create:
+                    cur[token] = {}
+                else:
+                    raise ValueError(f"path 父节点不存在: {token}")
             cur = cur[token]
         elif isinstance(cur, list):
             try:
@@ -1441,6 +1748,40 @@ def _json_pointer_set(data: dict, path: str, value) -> dict:
     else:
         raise ValueError("path 父节点不是对象或数组")
     return data
+
+
+def _validate_form_component(comp: dict) -> str | None:
+    """Phase 8b: 校验 text_field/select/toggle 必填字段;返回错误字符串或 None。"""
+    comp_id = comp.get("id")
+    comp_type = comp.get("type")
+    value_path = comp.get("value_path")
+    if not isinstance(value_path, str) or not (value_path == "/" or value_path.startswith("/")):
+        return f"组件 {comp_id} ({comp_type}) 缺少合法的 value_path (JSON Pointer)"
+    if comp_type == "text_field":
+        input_type = comp.get("input_type", "shortText")
+        if input_type not in _SUPPORTED_TEXT_FIELD_INPUT_TYPES:
+            return f"组件 {comp_id} input_type 非法: {input_type}"
+    elif comp_type == "select":
+        options = comp.get("options")
+        if not isinstance(options, list) or not options:
+            return f"组件 {comp_id} (select) options 必须是非空数组"
+        for opt_idx, opt in enumerate(options):
+            if not isinstance(opt, dict) or "value" not in opt:
+                return f"组件 {comp_id} options[{opt_idx}] 必须含 value 字段"
+    elif comp_type == "toggle":
+        pass  # value_path 已校验
+    return None
+
+
+def _has_form_components(args: dict) -> bool:
+    """Phase 8b: 检测 render_ui 参数中是否含 text_field/select/toggle 组件。CLI 短路用。"""
+    components = args.get("components") if isinstance(args, dict) else None
+    if not isinstance(components, list):
+        return False
+    for comp in components:
+        if isinstance(comp, dict) and comp.get("type") in _FORM_UI_COMPONENT_TYPES:
+            return True
+    return False
 
 
 def _execute_render_ui(args: dict) -> dict:
@@ -1470,12 +1811,22 @@ def _execute_render_ui(args: dict) -> dict:
             return {"ok": False, "error": f"render_ui 参数错误: 组件 id 重复: {comp_id}"}
         if not isinstance(comp_type, str) or comp_type not in _SUPPORTED_UI_COMPONENT_TYPES:
             return {"ok": False, "error": f"render_ui 参数错误: 不支持的组件 type: {comp_type}"}
+        # Phase 8b: 表单组件 schema 校验。失败立即返回,前端不渲染半成品。
+        if comp_type in _FORM_UI_COMPONENT_TYPES:
+            err = _validate_form_component(comp)
+            if err:
+                return {"ok": False, "error": f"render_ui 参数错误: {err}"}
         seen_ids.add(comp_id)
         has_root = has_root or comp_id == "root"
         cleaned.append(comp)
 
     if not has_root:
-        return {"ok": False, "error": "render_ui 参数错误: components 必须包含 id='root' 的根节点"}
+        # Phase 8a: 流式增量场景下,后续调用可不带 root —— root 由
+        # _execute_render_ui_for_session 检查是否已在 surface 中。
+        # 此处只在"找不到根 + complete=true(默认)"且无 surface 上下文时才会触发硬错;
+        # 真正的 root 存在性最终由 for_session 兜底。
+        # 把信号传上去,让上层决定是否容忍。
+        pass
 
     data = args.get("data")
     if data is not None and not isinstance(data, dict):
@@ -1486,6 +1837,8 @@ def _execute_render_ui(args: dict) -> dict:
         "surface_id": surface_id,
         "components": cleaned,
         "data": data or {},
+        "complete": bool(args.get("complete", True)),
+        "has_root": has_root,
     }
 
 
@@ -1518,14 +1871,43 @@ def _execute_update_ui_data(args: dict, session_id: str) -> dict:
 
 def _execute_render_ui_for_session(args: dict, session_id: str) -> dict:
     result = _execute_render_ui(args)
-    if result.get("ok"):
-        _register_ui_surface(
-            session_id,
-            result["surface_id"],
-            result["components"],
-            result["data"],
+    if not result.get("ok"):
+        return result
+
+    # Phase 8a: complete=false 走增量合并;complete=true 保持覆盖语义。
+    merge = not result.get("complete", True)
+
+    # Phase 8a fix: 流式增量场景下,后续调用可不带 root —— 只要已存在 surface 含 root 即可。
+    # 一次性渲染场景(complete=true),或新 surface 的首次流式调用,都必须含 root。
+    if not result.get("has_root"):
+        existing = _UI_SURFACES.get(session_id, {}).get(result["surface_id"])
+        existing_components = existing.get("components") if existing else None
+        existing_has_root = any(
+            isinstance(c, dict) and c.get("id") == "root"
+            for c in (existing_components or [])
         )
-        result["tool_result"] = "UI 已渲染"
+        if not (merge and existing_has_root):
+            return {
+                "ok": False,
+                "error": "render_ui 参数错误: components 必须包含 id='root' 的根节点"
+                         "(流式增量场景下首次调用必须含 root)",
+            }
+
+    _register_ui_surface(
+        session_id,
+        result["surface_id"],
+        result["components"],
+        result["data"],
+        merge=merge,
+    )
+    result["tool_result"] = "UI 已渲染"
+    # Phase 7b: 流式渲染信号 —— complete=false 时,通知前端可开始首次渲染。
+    if not result.get("complete", True):
+        result["begin_rendering"] = {
+            "surface_id": result["surface_id"],
+            "root": "root",
+            "catalog_id": "simple_chat_agent_demo",
+        }
     return result
 
 
@@ -1602,7 +1984,14 @@ def _react_chat_native(memory: Memory, user_input: str) -> str:
                     "请直接以文本方式向用户说明或寻求其他途径]"
                 )
             elif tc["name"] in IMMEDIATE_LOCAL_TOOLS:
-                tool_result = f"{tc['name']} 仅 Web 模式可见，请用文本继续说明。"
+                # Phase 8b: render_ui 含表单组件时,给出更明确的回退提示。
+                if tc["name"] == "render_ui" and _has_form_components(args):
+                    tool_result = (
+                        "[render_ui 含 text_field/select/toggle 表单组件,"
+                        "仅 Web 模式可见。请直接以文本方式询问用户对应字段。]"
+                    )
+                else:
+                    tool_result = f"{tc['name']} 仅 Web 模式可见，请用文本继续说明。"
             else:
                 tool_result = mcp_web_search.call_tool_sync(tc["name"], args)
             logger.info("执行工具调用:%s,结果=%s", tc["name"], tool_result)
@@ -1635,6 +2024,33 @@ async def _stream_react_rounds(
     """
     tool_stats = tool_stats or _new_tool_stats()
     for round_num in range(start_round, MAX_ROUNDS):
+        # ============ 0) Phase 9a: drain steer 队列 ============
+        # 仅在 "非 resume 接续" 且 "OpenAI 顺序允许 user 追加" 时消费 steer。
+        # OpenAI 约束: assistant.tool_calls 后必须紧跟 role=tool, 此时不能塞 user。
+        # 不满足条件的 steer 留在队列, 下一轮顶部再 drain。
+        if not pending_remaining and _can_append_user_message(messages):
+            steers = _drain_steers(session_id)
+            for steer_msg in steers:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[Steering] 用户在 Agent 运行期间发起方向纠正,"
+                        f"优先采纳以下指令:\n{steer_msg}"
+                    ),
+                })
+                _record_steer(session_id, steer_msg)
+                yield ("steer_applied", {"message": steer_msg, "round": round_num})
+            if steers and session_id:
+                # Phase 9b: agent_state_delta 整段 replace steer_history
+                # (朴素实现, 避免数组 add(/-) 的索引边界争议)
+                yield ("agent_state_delta", {
+                    "patch": [{
+                        "op": "replace",
+                        "path": "/steer_history",
+                        "value": list(_STEER_HISTORY.get(session_id) or []),
+                    }],
+                })
+
         # ============ 1) 取本轮 tool_calls ============
         # resume 第一轮:直接复用断点处尚未消费的剩余队列,**跳过** LLM 调用
         if pending_remaining:
@@ -1648,6 +2064,11 @@ async def _stream_react_rounds(
             )
         else:
             yield ("status", {"phase": "thinking", "round": round_num})
+            if session_id:
+                # Phase 9b: round 推进 delta (与 status 同时机, 标记新轮次)
+                yield ("agent_state_delta", {
+                    "patch": [{"op": "replace", "path": "/round", "value": round_num}],
+                })
             logger.info(
                 "ReAct 第 %d 轮开始(chat+native):msg_count=%d tools=%s",
                 round_num, len(messages), [t["function"]["name"] for t in tools],
@@ -1737,6 +2158,11 @@ async def _stream_react_rounds(
             if tc["name"] == "web_search":
                 tool_stats["search_calls"] += 1
             yield ("tool_call", {"name": tc["name"], "args": args})
+            if session_id:
+                # Phase 9b: 工具计数更新 delta (在 tool_call emit 后立即同步, 前端能看到累计)
+                yield ("agent_state_delta", {
+                    "patch": [{"op": "replace", "path": "/tool_stats", "value": dict(tool_stats)}],
+                })
 
             if tc["name"] == "create_plan":
                 pending_state = {
@@ -1807,9 +2233,12 @@ async def _stream_react_rounds(
                 if result.get("ok") and tc["name"] == "render_ui":
                     surface_id = result["surface_id"]
                     yield ("ui_surface_create", {"surface_id": surface_id})
+                    # Phase 8a fix B1: mode 字段对齐双端合并语义。
+                    # complete=true → replace(前端清空 Map 再装入); complete=false → merge(前端按 id 合并)。
                     yield ("ui_surface_update", {
                         "surface_id": surface_id,
                         "components": result["components"],
+                        "mode": "merge" if not result.get("complete", True) else "replace",
                     })
                     if result.get("data"):
                         yield ("ui_data_update", {
@@ -1817,6 +2246,9 @@ async def _stream_react_rounds(
                             "path": "/",
                             "value": result["data"],
                         })
+                    # Phase 7b: 流式渲染信号
+                    if result.get("begin_rendering"):
+                        yield ("begin_rendering", result["begin_rendering"])
                     tool_result = result.get("tool_result") or "UI 已渲染"
                 elif result.get("ok") and tc["name"] == "update_ui_data":
                     yield ("ui_data_update", {
@@ -1882,17 +2314,36 @@ async def _stream_chat_native(
     is_disconnected: Callable[[], Awaitable[bool]],
     session_id: str,
     adaptive_fragment: str = "",
+    images: list[str] | None = None,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """[chat 模式 + native function calling] 异步流式 ReAct 循环,Web 用。
 
     yield 的 (event_name, payload) 元组**完全复用**现有 SSE 契约,新增 await_user 一项:
         status / thinking / chunk / tool_call / tool_result / await_user / done / error
+
+    Phase 10a: `images` (data URL list) 仅注入到 fresh turn 的初始 user 节点。
+    后续 ReAct 多轮通过 append tool result / assistant 到同一份 messages list 续跑,
+    user 节点保持 vision content 不变 —— 下一个 fresh /api/chat 是新调用,
+    Memory 重建时 images 默认 None, 历史对话天然不携带图片 (D2/D4 安全防线)。
     """
     # 新一轮 chat：清掉旧 pending，防止僵尸 _PENDING 项常驻
     if _PENDING.pop(session_id, None) is not None:
         _save_runtime_state(session_id)
 
-    messages = _memory_to_messages(memory, USER_PROMPT, user_input, adaptive_fragment)
+    # Phase 9 fix B2: 同纲领清掉旧 steer 队列残留。
+    # 触发场景: 用户在旧流活跃中点击 steer 后关闭浏览器(SSE 流断, 但 steer 残留队列),
+    # 重开页面发起新 chat 时, 旧 steer 不应注入新对话。
+    # _STEER_HISTORY 不清 —— 那是只供前端展示的历史, 跨 chat 累计才有意义。
+    stale_queue = _STEER_QUEUES.pop(session_id, None)
+    if stale_queue is not None and stale_queue.qsize() > 0:
+        logger.info(
+            "新 chat 启动:丢弃 %d 条未消费的旧 steer (session=%s)",
+            stale_queue.qsize(), session_id,
+        )
+
+    messages = _memory_to_messages(
+        memory, USER_PROMPT, user_input, adaptive_fragment, images=images,
+    )
     try:
         tools = await _build_native_tools_async()
     except Exception as exc:
@@ -1954,6 +2405,30 @@ async def _stream_plan_step_rounds(
     pending_remaining = pending_remaining or []
 
     for round_num in range(start_round, PLAN_STEP_MAX_ROUNDS):
+        # Phase 9a: drain steer 队列 —— 与 _stream_react_rounds 同纲领, 但 steer 文本
+        # 带 [计划 | 步骤] 上下文提示, 让模型理解当前在 plan-step 内部, 自行决定是否结束步骤。
+        # 不在 plan-step 内 emit /round delta (避免与全局 round 概念混淆), 仅 emit steer_history delta。
+        if not pending_remaining and _can_append_user_message(messages):
+            steers = _drain_steers(session_id)
+            for steer_msg in steers:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[Steering | 计划 {plan.get('title') or ''} | 步骤 {step.get('title') or ''}] "
+                        f"用户在计划步骤执行期间发起方向纠正,优先采纳以下指令:\n{steer_msg}"
+                    ),
+                })
+                _record_steer(session_id, steer_msg)
+                yield ("steer_applied", {"message": steer_msg, "round": round_num})
+            if steers and session_id:
+                yield ("agent_state_delta", {
+                    "patch": [{
+                        "op": "replace",
+                        "path": "/steer_history",
+                        "value": list(_STEER_HISTORY.get(session_id) or []),
+                    }],
+                })
+
         if pending_remaining:
             accumulated_tool_calls = pending_remaining
             pending_remaining = []
@@ -2059,9 +2534,17 @@ async def _stream_plan_step_rounds(
                 if result.get("ok") and tc["name"] == "render_ui":
                     surface_id = result["surface_id"]
                     yield ("ui_surface_create", {"surface_id": surface_id})
-                    yield ("ui_surface_update", {"surface_id": surface_id, "components": result["components"]})
+                    # Phase 8a fix B1: mode 字段对齐双端合并语义。
+                    yield ("ui_surface_update", {
+                        "surface_id": surface_id,
+                        "components": result["components"],
+                        "mode": "merge" if not result.get("complete", True) else "replace",
+                    })
                     if result.get("data"):
                         yield ("ui_data_update", {"surface_id": surface_id, "path": "/", "value": result["data"]})
+                    # Phase 7b: 流式渲染信号
+                    if result.get("begin_rendering"):
+                        yield ("begin_rendering", result["begin_rendering"])
                     tool_result = result.get("tool_result") or "UI 已渲染"
                 elif result.get("ok") and tc["name"] == "update_ui_data":
                     yield ("ui_data_update", {
@@ -2305,8 +2788,15 @@ def ui_action_response(
     component_id: str,
     event_name: str,
     is_disconnected: Callable[[], Awaitable[bool]],
+    *,
+    form_data: dict | None = None,
 ) -> AsyncGenerator[tuple[str, dict], None]:
-    """声明式 UI button 点击入口:校验内存态 action 后,作为结构化用户事件进入 ReAct。"""
+    """声明式 UI button 点击入口:校验内存态 action 后,作为结构化用户事件进入 ReAct。
+
+    Phase 8b: form_data 是前端 surface.data 快照(含表单字段值),会注入到
+    [UI Action] 文本供模型读取,并同步写回 _UI_SURFACES[..]['data'] 保持
+    服务端镜像与客户端一致。
+    """
     if API_MODE != "chat":
         raise UiActionUnavailable("ui_action 仅在 API_MODE=chat 下可用")
     if not SESSION_ID_RE.match(session_id):
@@ -2318,8 +2808,21 @@ def ui_action_response(
     if action["event_name"] != event_name:
         raise UiActionMismatch(event_name)
 
+    # Phase 8b: 将表单快照写回服务端 surface,保持双端一致。
+    # Fix B5: 浅合并而非整体覆盖 —— 避免擦掉模型通过 update_ui_data 写入的、
+    # 前端不可见的私有字段(如 token/internal state)。前端表单的 value_path
+    # 通常是顶层 key,浅合并已足够;深嵌套表单字段会整体覆盖对应顶层 key,
+    # 这是浅合并的固有限制,可接受。
+    if isinstance(form_data, dict) and form_data:
+        existing_data = surface.get("data")
+        if not isinstance(existing_data, dict):
+            existing_data = {}
+            surface["data"] = existing_data
+        existing_data.update(form_data)
+        _save_runtime_state(session_id)
+
     context_json = json.dumps(action.get("context") or {}, ensure_ascii=False)
-    user_event = "\n".join([
+    lines = [
         "[UI Action]",
         "用户点击了声明式 UI 上的按钮。",
         f"surface_id: {surface_id}",
@@ -2327,10 +2830,45 @@ def ui_action_response(
         f"label: {action.get('label') or component_id}",
         f"event_name: {event_name}",
         f"context: {context_json}",
-        "请基于这个用户交互继续完成任务;如需更新当前 UI,调用 update_ui_data。",
-    ])
+    ]
+    if isinstance(form_data, dict) and form_data:
+        lines.append(f"form_data: {json.dumps(form_data, ensure_ascii=False)}")
+    lines.append("请基于这个用户交互继续完成任务;如需更新当前 UI,调用 update_ui_data。")
+    user_event = "\n".join(lines)
     memory = get_or_load(session_id)
     return stream_agent_response(memory, user_event, is_disconnected, session_id, None)
+
+
+# ============================================================
+# Phase 9a Agent Steering —— /api/steer 入口
+# ============================================================
+
+def steer_response(session_id: str, message: str) -> dict:
+    """把用户的纠偏指令入队, 由当前/下次 ReAct 流在轮次边界消费。
+
+    **关键设计**: 本函数立即返回 dict (非 SSE 流), 且不获取 _SESSION_LOCKS ——
+    否则与正在持有锁的 SSE 流死锁。允许无活跃流时入队 (等待下一次 /api/chat 消费),
+    简化前端时序; 也允许同一活跃流期间入队多条 (单 turn drain 时一并消费)。
+
+    raises:
+        SteerUnavailable: 非 chat 模式 / message 非空校验失败
+        InvalidSessionId: session_id 非 UUID 形态
+    """
+    if API_MODE != "chat":
+        raise SteerUnavailable("steer 仅在 API_MODE=chat 下可用")
+    if not SESSION_ID_RE.match(session_id):
+        raise InvalidSessionId(session_id)
+    if not isinstance(message, str) or not message.strip():
+        raise SteerUnavailable("steer message 不能为空")
+
+    queue = get_steer_queue(session_id)
+    payload = message.strip()
+    queue.put_nowait(payload)
+    logger.info(
+        "steer 入队: session=%s msg_chars=%d queue_size=%d",
+        session_id, len(payload), queue.qsize(),
+    )
+    return {"ok": True, "queued": True, "queue_size": queue.qsize()}
 
 
 # ============================================================
@@ -2514,6 +3052,7 @@ async def stream_agent_response(
     is_disconnected: Callable[[], Awaitable[bool]],
     session_id: str = "",
     context: dict | None = None,
+    images: list[str] | None = None,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """ReAct 流式循环,yield 抽象 (event_name, payload_dict) 元组,与 SSE/HTTP 层解耦。
 
@@ -2550,11 +3089,25 @@ async def stream_agent_response(
     if ui_mode != "chat":
         yield ("ui_hint", {"mode": ui_mode, "reason": ui_reason})
 
+    # Phase 9b: 流开头发一次完整 agent 状态快照, 前端用于初始化 reducer。
+    # 仅 chat 模式 (responses 模式不参与 Phase 3+ 新功能, 与一贯约束一致)。
+    if API_MODE == "chat" and session_id:
+        yield ("agent_state_snapshot", _agent_state_payload(session_id, round_num=0))
+
     if API_MODE == "chat":
         async for event in _stream_chat_native(
             memory, user_input, is_disconnected, session_id, adaptive_fragment,
+            images=images,
         ):
             yield event
+        return
+
+    # Phase 10a: responses 模式是字符串 prompt 接口, 无法承载结构化 vision content。
+    # 与 Phase 3+ 一贯约束一致: 不为 responses 模式适配多模态。显式失败而不静默丢图。
+    if images:
+        yield ("error", {
+            "message": "图片附件仅在 chat 模式可用。请重启服务并设置 export API_MODE=chat",
+        })
         return
 
     latest_input = user_input

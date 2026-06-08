@@ -1,0 +1,176 @@
+{
+  "version": 1,
+  "id": "ata::article-draft-page-query-with-permission",
+  "description": "分页查询自己的文章草稿信息",
+  "javaMethod": "com.alibaba.atasuper.client.v2.article.draft.ArticleDraftClientService#pageQueryWithPermission",
+  "inputSchema": {
+    "description": "分页查询自己的文章草稿信息",
+    "properties": {
+      "fieldName_0": {
+        "description": "查询参数",
+        "properties": {
+          "currentPage": {
+            "description": "当前页码",
+            "type": "number"
+          },
+          "pageSize": {
+            "description": "分页大小",
+            "type": "number"
+          },
+          "enableReturnCount": {
+            "description": "是否返回总条数",
+            "type": "boolean"
+          },
+          "orderByList": {
+            "items": {
+              "description": "排序的字段信息",
+              "properties": {
+                "orderConditionName": {
+                  "description": "排序字段名;修改时间:MODIFYTIME",
+                  "type": "string"
+                },
+                "direction": {
+                  "description": "排序;ASC:顺序;DESC:倒序",
+                  "enum": [
+                    "ASC",
+                    "DESC"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "orderConditionName",
+                "direction"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "fieldName_1": {
+        "description": "返回字段的选择器，可以返回一些额外字段，在选择器中没有的字段默认这个接口都会直接返回的，在用户没有特别说明的情况下选择器建议不传任何字段",
+        "properties": {
+          "withBlobs": {
+            "description": "是否查询大字段内容",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "required": [
+      "fieldName_0"
+    ],
+    "type": "object"
+  },
+  "outputSchema": {
+    "description": "AtaPageResult<ArticleDraftClientDTO> 草稿分页结果",
+    "type": "object",
+    "properties": {
+      "success": {
+        "type": "boolean",
+        "description": "是否成功"
+      },
+      "errorCode": {
+        "type": "string",
+        "description": "错误编码"
+      },
+      "errorMsg": {
+        "type": "string",
+        "description": "错误信息"
+      },
+      "traceId": {
+        "type": "string",
+        "description": "追踪id"
+      },
+      "content": {
+        "type": "object",
+        "description": "分页数据",
+        "properties": {
+          "data": {
+            "type": "array",
+            "description": "草稿列表",
+            "items": {
+              "$ref": "#/$defs/ArticleDraftClientDTO"
+            }
+          },
+          "totalCount": {
+            "type": "number",
+            "description": "总条数（需要 enableReturnCount=true 才会返回）"
+          },
+          "currentPage": {
+            "type": "number",
+            "description": "当前页码"
+          },
+          "pageSize": {
+            "type": "number",
+            "description": "分页大小"
+          }
+        }
+      }
+    },
+    "$defs": {
+      "ArticleDraftClientDTO": {
+        "type": "object",
+        "description": "文章草稿信息",
+        "properties": {
+          "id": {
+            "type": "number",
+            "description": "草稿 id"
+          },
+          "aid": {
+            "type": "number",
+            "description": "文章 id"
+          },
+          "userId": {
+            "type": "number",
+            "description": "作者 uid"
+          },
+          "title": {
+            "type": "string",
+            "description": "文章标题"
+          },
+          "createTime": {
+            "type": "string",
+            "description": "创建时间"
+          },
+          "modifyTime": {
+            "type": "string",
+            "description": "修改时间"
+          },
+          "ismarkdown": {
+            "type": "boolean",
+            "description": "是否 markdown 格式"
+          },
+          "editorVersion": {
+            "type": "number",
+            "description": "编辑器版本，0 旧版，1 新版"
+          },
+          "saveType": {
+            "type": "string",
+            "description": "保存类型"
+          },
+          "content": {
+            "type": "string",
+            "description": "文章内容（需 selector withBlobs=true）"
+          },
+          "dingContent": {
+            "type": "string",
+            "description": "钉钉编辑器的内容（需 selector withBlobs=true）"
+          },
+          "htmlContent": {
+            "type": "string",
+            "description": "html 内容（需 selector withBlobs=true）"
+          }
+        },
+        "required": [
+          "id",
+          "userId",
+          "title"
+        ]
+      }
+    }
+  }
+}

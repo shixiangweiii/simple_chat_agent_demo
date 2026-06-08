@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "id": "ata::message-ding-talk-send-to-webhook",
+  "description": "使用钉钉机器人`ATA技小蜜`给指定钉钉群推送一条消息，可以把内容信息推送到钉钉群。",
+  "javaMethod": "com.alibaba.atasuper.client.v2.message.MessageClientService#dingTalkSendToWebhook",
+  "inputSchema": {
+    "description": "使用钉钉机器人`ATA技小蜜`给指定钉钉群推送一条消息，可以把内容信息推送到钉钉群。",
+    "properties": {
+      "fieldName_0": {
+        "description": "推送消息的参数",
+        "properties": {
+          "markdownContent": {
+            "description": "需要推送的markdown格式内容",
+            "type": "string"
+          },
+          "title": {
+            "description": "显示在钉钉的标题信息",
+            "type": "string"
+          },
+          "webhook": {
+            "description": "`ATA技小蜜`机器人的webhook，类似于```https://oapi.dingtalk.com/robot/send?access_token=xxxx```，该字段需要用户提供，如果用户没有提供直接提示用户`在需要推送的群搜索并加入机器人【ATA技小蜜】，并复制 webhook 作为参数`",
+            "type": "string"
+          }
+        },
+        "required": [
+          "webhook",
+          "markdownContent",
+          "title"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "fieldName_0"
+    ],
+    "type": "object"
+  },
+  "outputSchema": {
+    "description": "AtaActionResult 操作结果",
+    "type": "object",
+    "properties": {
+      "success": {
+        "type": "boolean",
+        "description": "是否推送成功"
+      },
+      "errorCode": {
+        "type": "string",
+        "description": "错误编码"
+      },
+      "errorMsg": {
+        "type": "string",
+        "description": "错误信息"
+      },
+      "traceId": {
+        "type": "string",
+        "description": "追踪id"
+      }
+    },
+    "required": [
+      "success"
+    ]
+  }
+}

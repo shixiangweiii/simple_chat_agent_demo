@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "id": "ata::message-ding-talk-send-to-me",
+  "description": "使用钉钉机器人`ATA技小蜜`给当前用户推送一条钉钉消息，可以把内容信息推送给当前用户。",
+  "javaMethod": "com.alibaba.atasuper.client.v2.message.MessageClientService#dingTalkSendToMe",
+  "inputSchema": {
+    "description": "使用钉钉机器人`ATA技小蜜`给当前用户推送一条钉钉消息，可以把内容信息推送给当前用户。",
+    "properties": {
+      "fieldName_0": {
+        "description": "推送的参数",
+        "properties": {
+          "lastMessage": {
+            "description": "显示在钉钉的标题信息",
+            "type": "string"
+          },
+          "markdownContent": {
+            "description": "需要推送的markdown格式内容",
+            "type": "string"
+          }
+        },
+        "required": [
+          "markdownContent",
+          "lastMessage"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "fieldName_0"
+    ],
+    "type": "object"
+  },
+  "outputSchema": {
+    "description": "AtaActionResult 操作结果",
+    "type": "object",
+    "properties": {
+      "success": {
+        "type": "boolean",
+        "description": "是否推送成功"
+      },
+      "errorCode": {
+        "type": "string",
+        "description": "错误编码"
+      },
+      "errorMsg": {
+        "type": "string",
+        "description": "错误信息"
+      },
+      "traceId": {
+        "type": "string",
+        "description": "追踪id"
+      }
+    },
+    "required": [
+      "success"
+    ]
+  }
+}
