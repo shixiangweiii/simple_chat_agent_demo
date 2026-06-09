@@ -352,7 +352,8 @@ USER_PROMPT = """# 角色设定
 5. **声明式 UI**：当表格、对比卡片、按钮或**表单（多字段输入）**能让回答更清楚时，调用 `render_ui`；表单字段（`text_field`/`select`/`toggle`）通过 `value_path`（JSON Pointer）绑定到 surface 的 `data`，用户点击按钮提交时表单数据会一并回传给你；如需刷新已有界面数据，调用 `update_ui_data`；
 6. **协作式计划**：当任务明显需要多个步骤或用户确认执行顺序时，调用 `create_plan` 提交计划给用户审阅；计划确认后再逐步执行；
 7. 当下方"工具列表"中有自定义工具时，按 Thought/Action/Observation 协议调用；
-8. 既不需要联网也不需要自定义工具时，直接给出清晰、有帮助的回复。
+8. **文件附件处理**：用户消息后可能跟随若干 `[附件 N] <文件名> (<mime>, <字符数>)` + ` ``` ` 代码块。它们是用户随消息上传的文本文件(代码/数据/文档),优先围绕附件内容回答。若代码块结尾出现 `...(已截断, 原 N 字符)`,意味着附件被裁剪,**回答前主动提醒用户**哪些部分不可见,必要时建议拆分上传。同时存在图片与附件时,按问题指向选择重点:代码 review / 数据分析 → 看附件;视觉理解 / OCR → 看图片。
+9. 既不需要联网也不需要自定义工具时，直接给出清晰、有帮助的回复。
 
 ## 行为准则
 - 回复简洁明了，避免冗余；
@@ -1151,9 +1152,106 @@ def build_prompt(user_prompt, tools, memory, latest_input, adaptive_fragment: st
 _NATIVE_TOOLS_CACHE: list[dict] | None = None
 
 
+# ============================================================
+# Phase 10b: 文本文件附件 —— prompt 拼装辅助
+# ============================================================
+# 与 web_chat_agent.MAX_ATTACHMENT_CHARS 对齐; 超此值业务层软截断, 不抛 (HTTP 层硬上限
+# 200KB 才硬拒)。教学定位: 让大附件可见但提醒模型该附件不完整, 而非直接 400 把用户推走。
+MAX_PER_FILE_CHARS_SOFT = 20 * 1024
+
+# mime_type → markdown 代码块语言标识 (优先级高于扩展名)
+_MIME_TO_LANG = {
+    "application/json": "json",
+    "application/xml": "xml",
+    "application/javascript": "javascript",
+    "application/typescript": "typescript",
+    "application/x-yaml": "yaml",
+    "text/x-python": "python",
+    "text/x-go": "go",
+    "text/x-rust": "rust",
+    "text/x-java": "java",
+    "text/x-c": "c",
+    "text/x-c++": "cpp",
+    "text/x-typescript": "typescript",
+    "text/x-yaml": "yaml",
+    "text/x-shellscript": "bash",
+    "text/markdown": "markdown",
+    "text/csv": "csv",
+    "text/html": "html",
+    "text/css": "css",
+    "text/javascript": "javascript",
+}
+# 扩展名 fallback (mime_type 未命中时用; 浏览器对很多扩展返回空 mime)
+_EXT_TO_LANG = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    ".md": "markdown", ".json": "json", ".csv": "csv",
+    ".html": "html", ".css": "css", ".xml": "xml",
+    ".yaml": "yaml", ".yml": "yaml", ".sh": "bash",
+    ".go": "go", ".rs": "rust", ".java": "java",
+    ".c": "c", ".cpp": "cpp", ".h": "c",
+}
+
+
+def _max_backtick_run(text: str) -> int:
+    """返回 text 中连续反引号的最大数量。用于决定外层 fence 长度。"""
+    import re as _re
+    runs = _re.findall(r"`+", text)
+    return max((len(r) for r in runs), default=0)
+
+
+def _build_attachment_block(attachments: list[dict]) -> str:
+    """把校验过的 attachments 列表序列化为人类可读 + LLM 友好的 markdown 文本块。
+
+    格式 (注入位置在 user_input **之后**, 避免长附件挤出短问题的注意力):
+
+        [以下是用户附带的 N 个文件]
+
+        [附件 1] file.py (text/x-python, 2345 字符)
+        ```python
+        ...content...
+        ```
+
+        [附件 2] data.csv (text/csv, 512 字符)
+        ```csv
+        ...content...
+        ```
+
+    单文件超过 MAX_PER_FILE_CHARS_SOFT 时软截断, 加 `...(已截断, 原 N 字符)` 尾标。
+    fence 长度自适应: 若 content 含 ``` 等反引号序列, 外层 fence 自动加长到比内层多 1
+    (CommonMark fence 长度竞争规则), 防止内容提前关闭围栏。
+    """
+    lines: list[str] = [f"[以下是用户附带的 {len(attachments)} 个文件]"]
+    for idx, att in enumerate(attachments, start=1):
+        filename = att["filename"]
+        mime_type = att["mime_type"]
+        content = att["content"]
+        original_len = len(content)
+        truncated = False
+        if original_len > MAX_PER_FILE_CHARS_SOFT:
+            content = content[:MAX_PER_FILE_CHARS_SOFT]
+            truncated = True
+        # 语言标识: mime 优先, 扩展名 fallback
+        lang = _MIME_TO_LANG.get(mime_type, "")
+        if not lang:
+            ext = os.path.splitext(filename)[1].lower()
+            lang = _EXT_TO_LANG.get(ext, "")
+        # fence 长度自适应: 至少 3 个反引号, 若内容含更多则 +1
+        fence_len = max(3, _max_backtick_run(content) + 1)
+        fence = "`" * fence_len
+        lines.append("")
+        lines.append(f"[附件 {idx}] {filename} ({mime_type}, {original_len} 字符)")
+        lines.append(f"{fence}{lang}")
+        lines.append(content)
+        if truncated:
+            lines.append(f"...(已截断, 原 {original_len} 字符)")
+        lines.append(fence)
+    return "\n".join(lines)
+
+
 def _memory_to_messages(
     memory: Memory, system_prompt: str, user_input: str, adaptive_fragment: str = "",
     images: list[str] | None = None,
+    attachments: list[dict] | None = None,
 ) -> list[dict]:
     """把 flat-string Memory 转成 OpenAI Chat Completions messages 数组。
 
@@ -1165,6 +1263,10 @@ def _memory_to_messages(
     历史 turn 的 content 保持 str (Memory 不存图, 自然只能是文本)。
     `llm_client._llm_stream_chat_with_tools` 透传 messages 给 OpenAI SDK,
     SDK 对 str/list 两种 content 都原生支持, 无需任何修改 —— 这是协议无感的优雅样本。
+
+    Phase 10b: 若 `attachments` 非空, 把 _build_attachment_block 拼出的 markdown
+    代码块文本追加到 user_input **之后**(不是之前 —— 长附件在前会把短问题挤出
+    模型注意力窗口尾部); 与 images 正交, 两者可共存。
     """
     sys_content = system_prompt
     if adaptive_fragment:
@@ -1173,13 +1275,17 @@ def _memory_to_messages(
     for m in memory.memories:
         role = "user" if m["role"] == Memory.USER else "assistant"
         messages.append({"role": role, "content": m["msg"]})
+    # Phase 10b: 附件追加在 user_input 后
+    text_part = user_input
+    if attachments:
+        text_part = f"{user_input}\n\n{_build_attachment_block(attachments)}"
     if images:
-        user_content: list[dict] = [{"type": "text", "text": user_input}]
+        user_content: list[dict] = [{"type": "text", "text": text_part}]
         for url in images:
             user_content.append({"type": "image_url", "image_url": {"url": url}})
         messages.append({"role": "user", "content": user_content})
     else:
-        messages.append({"role": "user", "content": user_input})
+        messages.append({"role": "user", "content": text_part})
     return messages
 
 
@@ -2315,6 +2421,7 @@ async def _stream_chat_native(
     session_id: str,
     adaptive_fragment: str = "",
     images: list[str] | None = None,
+    attachments: list[dict] | None = None,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """[chat 模式 + native function calling] 异步流式 ReAct 循环,Web 用。
 
@@ -2325,6 +2432,12 @@ async def _stream_chat_native(
     后续 ReAct 多轮通过 append tool result / assistant 到同一份 messages list 续跑,
     user 节点保持 vision content 不变 —— 下一个 fresh /api/chat 是新调用,
     Memory 重建时 images 默认 None, 历史对话天然不携带图片 (D2/D4 安全防线)。
+
+    Phase 10b: `attachments` (list[{filename, content, mime_type}]) 同 images 一样
+    只注入 fresh turn, 由 _memory_to_messages 拼成 markdown 代码块追加到 user_input 后。
+    HITL pending 不单独存 attachments; 附件已烘焙进 messages, 随 _PENDING["messages"]
+    间接持久化到 runtime_state sidecar (与 images 对称, resume 后模型需看原始附件内容才能继续推理);
+    Memory / runtime_state 不存 attachments (D2/D4 安全防线, 与 images 对称)。
     """
     # 新一轮 chat：清掉旧 pending，防止僵尸 _PENDING 项常驻
     if _PENDING.pop(session_id, None) is not None:
@@ -2343,6 +2456,7 @@ async def _stream_chat_native(
 
     messages = _memory_to_messages(
         memory, USER_PROMPT, user_input, adaptive_fragment, images=images,
+        attachments=attachments,
     )
     try:
         tools = await _build_native_tools_async()
@@ -3053,6 +3167,7 @@ async def stream_agent_response(
     session_id: str = "",
     context: dict | None = None,
     images: list[str] | None = None,
+    attachments: list[dict] | None = None,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """ReAct 流式循环,yield 抽象 (event_name, payload_dict) 元组,与 SSE/HTTP 层解耦。
 
@@ -3097,7 +3212,7 @@ async def stream_agent_response(
     if API_MODE == "chat":
         async for event in _stream_chat_native(
             memory, user_input, is_disconnected, session_id, adaptive_fragment,
-            images=images,
+            images=images, attachments=attachments,
         ):
             yield event
         return
@@ -3107,6 +3222,13 @@ async def stream_agent_response(
     if images:
         yield ("error", {
             "message": "图片附件仅在 chat 模式可用。请重启服务并设置 export API_MODE=chat",
+        })
+        return
+
+    # Phase 10b: responses 模式同理,无法把附件注入字符串 prompt;显式失败。
+    if attachments:
+        yield ("error", {
+            "message": "文件附件仅在 chat 模式可用。请重启服务并设置 export API_MODE=chat",
         })
         return
 

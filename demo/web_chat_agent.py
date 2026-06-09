@@ -131,6 +131,98 @@ def _validate_images(images: list[str] | None) -> list[str] | None:
 
 
 # ============================================================
+# Phase 10b: 文本文件附件限制 (HTTP 边界, 不放 chat_core)
+# ============================================================
+MAX_ATTACHMENTS_PER_TURN = 5
+MAX_ATTACHMENT_CHARS = 20 * 1024          # 单文件软上限 (业务层会截断,此处不拒)
+MAX_ATTACHMENT_HARD_CHARS = 100 * 1024    # 单文件硬上限 (HTTP 400); ≤ 总量上限
+MAX_ATTACHMENT_TOTAL_CHARS = 100 * 1024   # 全部附件总量硬上限
+MAX_FILENAME_LEN = 255
+ALLOWED_ATTACHMENT_MIMES = frozenset({
+    "text/plain", "text/markdown", "text/csv", "text/html", "text/css",
+    "text/javascript", "text/x-python", "text/x-go", "text/x-rust",
+    "text/x-java", "text/x-c", "text/x-c++", "text/x-typescript",
+    "text/x-yaml", "text/x-shellscript",
+    "application/json", "application/xml", "application/x-yaml",
+    "application/javascript", "application/typescript",
+})
+# filename 不允许出现的字符集合 (路径分隔符 / 控制字符 / Unicode 双向控制等)
+_RTL_CHARS = frozenset(
+    "‎‏‪‫‬‭‮"  # LRM/RLM/LRE/RLE/PDF/LRO/RLO
+)
+
+
+class AttachmentPayloadInvalid(ValueError):
+    """前端送来的 attachments 字段不通过后端硬校验。HTTP 层翻译为 400。
+
+    校验规则(与前端 attachFiles 双层防御):
+    - 总数 ≤ MAX_ATTACHMENTS_PER_TURN
+    - 每项必须符合 Attachment Pydantic 模型 (filename / content / mime_type 均为 str)
+    - filename: 非空白;长度 ≤ MAX_FILENAME_LEN;无路径分隔符/.. /控制字符/双向控制
+    - content: 不含 NUL;字符数 ≤ MAX_ATTACHMENT_HARD_CHARS
+    - mime_type: 严格白名单匹配 ALLOWED_ATTACHMENT_MIMES (不要 startswith)
+    - 全部累加 content 字符数 ≤ MAX_ATTACHMENT_TOTAL_CHARS
+    """
+
+
+class Attachment(BaseModel):
+    """Pydantic 模型: 单个文本文件附件。Pydantic 自动保证三键存在且为 str。"""
+    filename: str
+    content: str
+    mime_type: str
+
+
+def _validate_attachments(items: list[Attachment] | None) -> list[dict] | None:
+    """校验并归一化 attachments 字段。None / [] 都返回 None,让下游短路。
+
+    输入已是 Pydantic Attachment 对象 (ChatRequest 保证),这里只做业务约束校验。
+    """
+    if not items:
+        return None
+    if len(items) > MAX_ATTACHMENTS_PER_TURN:
+        raise AttachmentPayloadInvalid(
+            f"最多附带 {MAX_ATTACHMENTS_PER_TURN} 个文件(收到 {len(items)} 个)"
+        )
+    total_chars = 0
+    for idx, att in enumerate(items):
+        filename = att.filename
+        if not filename.strip():
+            raise AttachmentPayloadInvalid(f"第 {idx + 1} 个附件的文件名不能为空")
+        if len(filename) > MAX_FILENAME_LEN:
+            raise AttachmentPayloadInvalid(
+                f"第 {idx + 1} 个附件的文件名过长(>{MAX_FILENAME_LEN})"
+            )
+        if (
+            "/" in filename or "\\" in filename or ".." in filename
+            or any(ord(c) < 0x20 or ord(c) == 0x7f for c in filename)
+            or any(c in _RTL_CHARS for c in filename)
+        ):
+            raise AttachmentPayloadInvalid(
+                f"第 {idx + 1} 个附件的文件名含非法字符"
+            )
+        content = att.content
+        if "\x00" in content:
+            raise AttachmentPayloadInvalid(
+                f"第 {idx + 1} 个附件内容含 NUL 字符"
+            )
+        if len(content) > MAX_ATTACHMENT_HARD_CHARS:
+            raise AttachmentPayloadInvalid(
+                f"第 {idx + 1} 个附件过大(>{MAX_ATTACHMENT_HARD_CHARS // 1024}KB)"
+            )
+        mime_type = att.mime_type
+        if mime_type not in ALLOWED_ATTACHMENT_MIMES:
+            raise AttachmentPayloadInvalid(
+                f"第 {idx + 1} 个附件的 MIME 类型不支持: {mime_type}"
+            )
+        total_chars += len(content)
+    if total_chars > MAX_ATTACHMENT_TOTAL_CHARS:
+        raise AttachmentPayloadInvalid(
+            f"全部附件总量超限(>{MAX_ATTACHMENT_TOTAL_CHARS // 1024}KB)"
+        )
+    return [a.model_dump() for a in items]
+
+
+# ============================================================
 # 请求体模型
 # ============================================================
 
@@ -146,6 +238,8 @@ class ChatRequest(BaseModel):
     context: ChatContext | None = None
     # Phase 10a: 可选图片附件 base64 data URL list, 详见 _validate_images 校验
     images: list[str] | None = None
+    # Phase 10b: 文本文件附件, Pydantic 模型 + 业务约束见 _validate_attachments
+    attachments: list[Attachment] | None = None
 
 
 class ResetRequest(BaseModel):
@@ -267,12 +361,16 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
     else:
         context = req.context.dict(exclude_none=True)
     # Phase 10a: 图片 payload 后端硬校验(前端 attachImages 也做, 双层防御)
+    # Phase 10b: 文本附件 payload 后端硬校验(前端 attachFiles 也做, 双层防御)
     try:
         images = _validate_images(req.images)
-    except ImagePayloadInvalid as exc:
+        # _validate_attachments 接收 list[Attachment], 返回 list[dict] (给业务层)
+        attachments = _validate_attachments(req.attachments)
+    except (ImagePayloadInvalid, AttachmentPayloadInvalid) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     events = stream_agent_response(
-        memory, req.message, request.is_disconnected, req.session_id, context, images,
+        memory, req.message, request.is_disconnected, req.session_id,
+        context, images, attachments,
     )
     lock = get_session_lock(req.session_id)
 

@@ -883,3 +883,5 @@ Phase 6 (Confidence Signal) ← 横切 responses/chat 两条最终回答路径
 ## 下一步
 
 主线 Phase 1-4 与 Future Direction 中的 Checkpoint/Resume、Confidence Signal 已完成。后续可继续从 Future Directions 中选择 AG-UI 协议对齐、Agent Steering 或多模态感知作为进阶扩展。
+
+> **更新（2026-06-09）**：Phase 7（质量修复 + AG-UI/A2UI 协议对齐）、Phase 8（流式 UI + 表单组件）、Phase 9（Agent Steering + state snapshot/delta）、Phase 10（多模态：图片 / 文本附件 / 语音输入）已全部落地，详见 `docs/ROADMAP-智能体感知与生成式UI演化-Phase7-10.md`。

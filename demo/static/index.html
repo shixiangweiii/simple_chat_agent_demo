@@ -622,6 +622,61 @@
     border-radius: 8px;
   }
 
+  /* ---------- Phase 10b: 文本文件附件 chip ---------- */
+  .attached-files {
+    display: flex;
+    gap: 6px;
+    padding: 6px 16px 0;
+    flex-wrap: wrap;
+    background: var(--panel);
+  }
+  .attached-files:empty { display: none; }
+  .file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: #f9fafb;
+    font-size: 12px;
+    color: #475569;
+    max-width: 240px;
+  }
+  .file-chip .name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .file-chip .size {
+    color: #94a3b8;
+    flex-shrink: 0;
+  }
+  .file-chip .rm {
+    cursor: pointer;
+    border: none;
+    background: none;
+    color: #94a3b8;
+    padding: 0;
+    font-size: 12px;
+    line-height: 1;
+  }
+  .file-chip .rm:hover { color: #ef4444; }
+
+  /* ---------- Phase 10c: 语音输入 ---------- */
+  button.attach-btn.recording {
+    background: #fee2e2;
+    border-color: #ef4444;
+    border-style: solid;
+  }
+  .voice-interim {
+    padding: 4px 16px;
+    color: #94a3b8;
+    font-style: italic;
+    font-size: 12px;
+    background: var(--panel);
+  }
+
   .input-bar {
     display: flex;
     gap: 8px;
@@ -1213,9 +1268,14 @@
     </div>
     <!-- Phase 10a: 已选图片缩略图条, 空时 CSS :empty 折叠 -->
     <div class="attached-images" id="attached-images"></div>
+    <!-- Phase 10b: 已选文本附件 chip 条, 空时 CSS :empty 折叠 -->
+    <div class="attached-files" id="attached-files"></div>
     <div class="input-bar">
-      <button class="attach-btn" id="attach" title="添加图片 (≤3 张, 每张 ≤5MB)">📎</button>
-      <input type="file" id="file-input" accept="image/*" multiple style="display:none">
+      <button class="attach-btn" id="attach" title="添加图片或文本文件 (图≤3 张 / 文≤5 个)">📎</button>
+      <button class="attach-btn" id="mic" title="语音输入" style="display:none">🎤</button>
+      <input type="file" id="file-input"
+             accept="image/*,.txt,.md,.py,.js,.ts,.json,.csv,.xml,.html,.css,.yaml,.yml,.sh,.go,.rs,.java,.c,.cpp,.h"
+             multiple style="display:none">
       <textarea id="input" placeholder="说点什么..." rows="1"></textarea>
       <button class="send" id="send">发送</button>
     </div>
@@ -1281,6 +1341,10 @@
   const $fileInput = document.getElementById('file-input');
   const $attachedImages = document.getElementById('attached-images');
   const $inputBar = document.querySelector('.input-bar');
+  // Phase 10b: 文本附件
+  const $attachedFiles = document.getElementById('attached-files');
+  // Phase 10c: 语音输入
+  const $mic = document.getElementById('mic');
 
   // ---------- 锚点面板状态 ----------
   // 用户消息计数器:每次清屏归零,赋给 .msg.user 的 DOM id
@@ -2768,8 +2832,8 @@
   let attachedImages = []; // string[] of data URLs
 
   function isAttachDisabled() {
-    // 流活跃或 steer 模式时禁用 attach (与 send 同纲领)
-    return streamSteerActive || ($send.dataset.mode === 'steer');
+    // 流活跃 / steer 模式 / 语音识别中 → 禁用 attach
+    return streamSteerActive || ($send.dataset.mode === 'steer') || recognizing;
   }
 
   function renderAttachedImages() {
@@ -2828,13 +2892,23 @@
     renderAttachedImages();
   }
 
-  // 三路输入汇入:点击 / 拖拽 / 粘贴
+  // 三路输入汇入:点击 / 拖拽 / 粘贴 — Phase 10b 扩展为按 file.type 分流
+  function dispatchSelectedFiles(fileList) {
+    const imgs = [], others = [];
+    for (const f of fileList) {
+      if (f.type && f.type.startsWith('image/')) imgs.push(f);
+      else others.push(f);
+    }
+    if (imgs.length) attachImages(imgs);
+    if (others.length) attachFiles(others);
+  }
+
   $attach.addEventListener('click', () => {
     if (isAttachDisabled()) return;
     $fileInput.click();
   });
   $fileInput.addEventListener('change', (e) => {
-    attachImages(e.target.files);
+    dispatchSelectedFiles(e.target.files);
     e.target.value = ''; // 清 value 保证同一文件可重选
   });
   $inputBar.addEventListener('dragover', (e) => {
@@ -2850,9 +2924,10 @@
     $inputBar.classList.remove('drag-over');
     if (isAttachDisabled()) return;
     if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
-      attachImages(e.dataTransfer.files);
+      dispatchSelectedFiles(e.dataTransfer.files);
     }
   });
+  // paste 保持仅图片: 文本粘贴走 textarea, 文件从剪贴板粘没有 UX 意义
   document.addEventListener('paste', (e) => {
     if (isAttachDisabled()) return;
     const items = e.clipboardData && e.clipboardData.items;
@@ -2867,9 +2942,171 @@
     if (files.length) attachImages(files);
   });
 
+  // ============================================================
+  // Phase 10b: 文本文件附件 — 与 attachImages 并行的独立路径
+  // ============================================================
+  const MAX_FILES = 5;
+  const MAX_FILE_BYTES = 100 * 1024;      // 与后端 MAX_ATTACHMENT_HARD_CHARS 对齐; >20KB 由后端软截断
+  const MAX_TOTAL_FILE_BYTES = 100 * 1024;
+  const ALLOWED_FILE_EXTS = new Set([
+    '.txt','.md','.py','.js','.ts','.json','.csv','.xml',
+    '.html','.css','.yaml','.yml','.sh','.go','.rs','.java',
+    '.c','.cpp','.h',
+  ]);
+  // 浏览器对很多扩展返回空 file.type, 此处做 mime 兜底
+  const EXT_TO_MIME = {
+    '.py':'text/x-python', '.md':'text/markdown', '.csv':'text/csv',
+    '.json':'application/json', '.xml':'application/xml',
+    '.yaml':'application/x-yaml', '.yml':'application/x-yaml',
+    '.js':'application/javascript', '.ts':'application/typescript',
+    '.html':'text/html', '.css':'text/css', '.sh':'text/x-shellscript',
+    '.go':'text/x-go', '.rs':'text/x-rust', '.java':'text/x-java',
+    '.c':'text/x-c', '.cpp':'text/x-c++', '.h':'text/x-c',
+    '.txt':'text/plain',
+  };
+  let attachedFiles = [];  // {filename, content, mime_type, size}[]
+
+  function formatSize(bytes) {
+    if (bytes < 1024) return bytes + 'B';
+    return (bytes / 1024).toFixed(1) + 'KB';
+  }
+
+  async function attachFiles(files) {
+    if (isAttachDisabled()) return;
+    if (!files || !files.length) return;
+    let totalBytes = attachedFiles.reduce((s, f) => s + f.size, 0);
+    for (const file of files) {
+      if (attachedFiles.length >= MAX_FILES) {
+        showToast(`最多附带 ${MAX_FILES} 个文件`, true); break;
+      }
+      const dotIdx = file.name.lastIndexOf('.');
+      const ext = dotIdx >= 0 ? file.name.slice(dotIdx).toLowerCase() : '';
+      if (!ALLOWED_FILE_EXTS.has(ext)) {
+        showToast(`不支持的文件类型: ${file.name}`, true); continue;
+      }
+      if (file.size > MAX_FILE_BYTES) {
+        showToast(`文件过大 (>${formatSize(MAX_FILE_BYTES)}): ${file.name}`, true); continue;
+      }
+      if (totalBytes + file.size > MAX_TOTAL_FILE_BYTES) {
+        showToast(`总量超 ${formatSize(MAX_TOTAL_FILE_BYTES)}，跳过 ${file.name}`, true); continue;
+      }
+      try {
+        const content = await file.text();  // UTF-8
+        attachedFiles.push({
+          filename: file.name,
+          content,
+          mime_type: file.type || EXT_TO_MIME[ext] || 'text/plain',
+          size: file.size,
+        });
+        totalBytes += file.size;
+      } catch (e) { showToast(`读取失败: ${file.name}`, true); }
+    }
+    renderAttachedFiles();
+  }
+
+  function renderAttachedFiles() {
+    $attachedFiles.innerHTML = '';
+    attachedFiles.forEach((f, idx) => {
+      const chip = document.createElement('span');
+      chip.className = 'file-chip';
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'name';
+      nameSpan.textContent = f.filename;
+      chip.appendChild(nameSpan);
+      const sizeSpan = document.createElement('span');
+      sizeSpan.className = 'size';
+      sizeSpan.textContent = formatSize(f.size);
+      chip.appendChild(sizeSpan);
+      const rm = document.createElement('button');
+      rm.className = 'rm';
+      rm.textContent = '✖';
+      rm.title = '移除';
+      rm.addEventListener('click', () => {
+        attachedFiles.splice(idx, 1);
+        renderAttachedFiles();
+      });
+      chip.appendChild(rm);
+      $attachedFiles.appendChild(chip);
+    });
+  }
+
+  // ============================================================
+  // Phase 10c: 语音输入 — 纯前端 Web Speech API
+  // ============================================================
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recognition = null;
+  let recognizing = false;
+  let interimNode = null;
+
+  if (SR) {
+    $mic.style.display = '';
+    $mic.addEventListener('click', toggleVoice);
+  }
+
+  function toggleVoice() {
+    if (isAttachDisabled()) return;
+    if (recognizing) { recognition && recognition.stop(); return; }
+    if (!recognition) {
+      recognition = new SR();
+      recognition.lang = navigator.language || 'zh-CN';
+      recognition.continuous = false;
+      recognition.interimResults = true;
+      recognition.onresult = onSpeechResult;
+      recognition.onend = onSpeechEnd;
+      recognition.onerror = onSpeechError;
+    }
+    try {
+      recognition.start();
+      recognizing = true;
+      $mic.classList.add('recording');
+      $mic.textContent = '⏹';
+      showInterimNode('');
+    } catch (e) {
+      // Safari/Firefox 部分支持 → 失败惰性 hide
+      $mic.style.display = 'none';
+      showToast('语音识别不可用', true);
+    }
+  }
+
+  function onSpeechResult(e) {
+    let interim = '', finalText = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const t = e.results[i][0].transcript;
+      if (e.results[i].isFinal) finalText += t;
+      else interim += t;
+    }
+    if (interim) showInterimNode(interim);
+    if (finalText) {
+      $input.value = ($input.value || '') + finalText;
+      autoResize();
+      showInterimNode('');
+    }
+  }
+
+  function onSpeechEnd() {
+    recognizing = false;
+    $mic.classList.remove('recording');
+    $mic.textContent = '🎤';
+    showInterimNode('');
+  }
+
+  function onSpeechError(e) {
+    showToast(`语音识别失败: ${e.error || 'unknown'}`, true);
+    onSpeechEnd();
+  }
+
+  function showInterimNode(text) {
+    if (!interimNode) {
+      interimNode = document.createElement('div');
+      interimNode.className = 'voice-interim';
+      $inputBar.parentElement.insertBefore(interimNode, $inputBar);
+    }
+    interimNode.textContent = text;
+    interimNode.style.display = text ? '' : 'none';
+  }
   async function send() {
     const text = $input.value.trim();
-    if (!text && !attachedImages.length) return;
+    if (!text && !attachedImages.length && !attachedFiles.length) return;
     // Phase 9a: 流活跃 + steer 模式 → POST /api/steer (steer 仅文本, 不带图)
     if ($send.dataset.mode === 'steer' && streamSteerActive) {
       if (!text) { showToast('纠偏指令不能为空', true); return; }
@@ -2878,20 +3115,30 @@
     if (!canStartStream('聊天')) return;
     if (!SESSION_ID) { showToast('会话未就绪,请稍候', true); return; }
 
+    // Phase 10c fix: 停止活跃的语音识别, 防止残音泄漏到下一轮
+    if (recognizing && recognition) recognition.stop();
+
     // Phase 10a: 发送瞬间快照 images, 然后立即清空本地状态防止重发
     const imagesSnapshot = attachedImages.slice();
     attachedImages = [];
     renderAttachedImages();
+    // Phase 10b: 同纲领快照 attachedFiles
+    const filesSnapshot = attachedFiles.slice();
+    attachedFiles = [];
+    renderAttachedFiles();
 
     const context = collectContext();
     clearUiHint();
-    // 用户气泡: 文本 + 缩略图条 (展示用)
+    // 用户气泡: 文本 + 缩略图条 (展示用) + 文件 chip 条
     const userHtml = text ? escapeHtml(text).replace(/\n/g, '<br>') : '';
-    const userBubble = addMessage('user', userHtml, text || '[图片]');
+    const placeholder = text
+      || [imagesSnapshot.length && '[图片]', filesSnapshot.length && '[文件]']
+           .filter(Boolean).join(' + ')
+      || '';
+    const userBubble = addMessage('user', userHtml, placeholder);
     if (imagesSnapshot.length) {
       const stripe = document.createElement('div');
       stripe.className = 'attached-images';
-      // 直接复用 .attached-images CSS, 但在 user 气泡内部展示, 加 margin-top
       stripe.style.padding = '6px 0 0';
       imagesSnapshot.forEach((url, idx) => {
         const div = document.createElement('div');
@@ -2904,6 +3151,25 @@
       });
       userBubble.appendChild(stripe);
     }
+    if (filesSnapshot.length) {
+      const strip = document.createElement('div');
+      strip.className = 'attached-files';
+      strip.style.padding = '6px 0 0';
+      filesSnapshot.forEach((f) => {
+        const chip = document.createElement('span');
+        chip.className = 'file-chip';
+        const name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = `📄 ${f.filename}`;
+        chip.appendChild(name);
+        const sz = document.createElement('span');
+        sz.className = 'size';
+        sz.textContent = formatSize(f.size);
+        chip.appendChild(sz);
+        strip.appendChild(chip);
+      });
+      userBubble.appendChild(strip);
+    }
     $input.value = '';
     autoResize();
     setStreaming(true);
@@ -2912,13 +3178,19 @@
     try {
       const body = { session_id: SESSION_ID, message: text, context };
       if (imagesSnapshot.length) body.images = imagesSnapshot;
+      if (filesSnapshot.length) {
+        // 后端不需要 size 字段; 仅传 filename/content/mime_type
+        body.attachments = filesSnapshot.map(f => ({
+          filename: f.filename, content: f.content, mime_type: f.mime_type,
+        }));
+      }
       const resp = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
       if (!resp.ok || !resp.body) {
-        // Phase 10a: 尝试读 detail (后端 ImagePayloadInvalid 等 400 返回结构化错误)
+        // Phase 10a/10b: 尝试读 detail (后端 *PayloadInvalid 等 400 返回结构化错误)
         let detail = `HTTP ${resp.status}`;
         try {
           const errJson = await resp.json();
