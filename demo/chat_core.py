@@ -406,20 +406,16 @@ class Memory:
 
     @classmethod
     def from_markdown(cls, text):
-        """从 markdown 文本反序列化。解析异常或文本为空时返回空 Memory。"""
+        """从 markdown 文本反序列化。解析失败时抛异常；文本为空或无 turn 标记时返回空 Memory。"""
         mem = cls()
-        try:
-            matches = list(cls._TURN_RE.finditer(text))
-            for i, m in enumerate(matches):
-                role = m.group(1)
-                start = m.end()
-                end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-                msg = text[start:end].strip()
-                if msg:
-                    mem.add(role, msg)
-        except Exception:
-            logger.exception("Memory.from_markdown 解析失败,返回空 Memory")
-            return cls()
+        matches = list(cls._TURN_RE.finditer(text))
+        for i, m in enumerate(matches):
+            role = m.group(1)
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            msg = text[start:end].strip()
+            if msg:
+                mem.add(role, msg)
         return mem
 
 
@@ -864,7 +860,10 @@ def _read_meta(path: Path) -> dict:
 
 
 def get_or_load(session_id: str) -> Memory:
-    """命中内存直接返;否则尝试从 disk 读;最后回退空 Memory。结果写回 sessions 字典。"""
+    """命中内存直接返;否则尝试从 disk 读;最后回退空 Memory。结果写回 sessions 字典。
+
+    注意:磁盘归档解析失败时不缓存空 Memory,下次请求可重试 —— 避免永久丢失用户数据。
+    """
     _restore_runtime_state(session_id)
     if session_id in sessions:
         return sessions[session_id]
@@ -873,8 +872,8 @@ def get_or_load(session_id: str) -> Memory:
         try:
             mem = Memory.from_markdown(path.read_text(encoding="utf-8"))
         except Exception:
-            logger.exception("加载归档失败,回退空 Memory: %s", path)
-            mem = Memory()
+            logger.exception("加载归档失败,返回临时空 Memory(不缓存): %s", path)
+            return Memory()  # 不缓存，下次请求可重试
     else:
         mem = Memory()
     sessions[session_id] = mem
@@ -912,6 +911,7 @@ def archive_session(session_id: str) -> dict:
     """
     memory = get_or_load(session_id)
     if not memory.memories:
+        logger.debug("归档跳过:空 Memory, session_id=%s", session_id)
         return {"ok": True, "skipped": True}
     path = _archive_path(session_id)
     _atomic_write(path, memory.to_markdown(session_id))
@@ -931,6 +931,7 @@ def reset_session(session_id: str) -> None:
     # 否则下次该 sid 的 /api/chat 第一轮顶部 drain 会把过期纠偏注入新对话。
     _STEER_QUEUES.pop(session_id, None)
     _STEER_HISTORY.pop(session_id, None)
+    _SESSION_LOCKS.pop(session_id, None)
     _delete_runtime_state(session_id)
     path = _archive_path(session_id)
     path.unlink(missing_ok=True)
@@ -949,6 +950,7 @@ def delete_session(session_id: str) -> None:
     # 也避免进程内 dict 泄漏(_STEER_HISTORY 占内存)。
     _STEER_QUEUES.pop(session_id, None)
     _STEER_HISTORY.pop(session_id, None)
+    _SESSION_LOCKS.pop(session_id, None)
     _delete_runtime_state(session_id)
 
 
@@ -979,14 +981,21 @@ def list_sessions() -> list[dict]:
 
 
 def read_history(session_id: str) -> Memory:
-    """返回 session 的 Memory。优先内存,再 disk lazy-load,都没有则抛 HistoryNotFound。"""
+    """返回 session 的 Memory。优先内存,再 disk lazy-load,都没有则抛 HistoryNotFound。
+
+    磁盘归档解析失败时不缓存,抛 HistoryNotFound —— 与"无归档"语义对齐,下次请求可重试。
+    """
     _restore_runtime_state(session_id)
     if session_id in sessions and sessions[session_id].memories:
         return sessions[session_id]
     path = _archive_path(session_id)
     if not path.exists():
         raise HistoryNotFound(session_id)
-    mem = Memory.from_markdown(path.read_text(encoding="utf-8"))
+    try:
+        mem = Memory.from_markdown(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("归档解析失败: %s", path)
+        raise HistoryNotFound(session_id)
     sessions[session_id] = mem
     return mem
 
