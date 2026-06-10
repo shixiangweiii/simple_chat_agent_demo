@@ -345,7 +345,7 @@ patch 路径: `/steps/{i}/status`, `/steps/{i}/result_summary`, `/steps/{i}/erro
 | `pending` | `dict \| null` | 当前 HITL awaiting(如有) |
 | `steer_history` | `list[{ts, message}]` | 最近 10 条 steer 历史 |
 
-仅 `API_MODE=chat` 发,在每条 `/api/chat` / `/api/resume` / `/api/ui_action` / `/api/plan_*` 流开头发一次完整快照(在 `ui_hint` 之后)。前端用于初始化 agent 状态 reducer。
+仅 `API_MODE=chat` 发,**仅在 `/api/chat` 与 `/api/ui_action`** 流开头发一次完整快照(在 `ui_hint` 之后)—— 这两条都经 `stream_agent_response`（`ui_action_response` 复用它）。`/api/resume` 与各 `/api/plan_*` 流**不发**快照(它们不经 `stream_agent_response`），前端 reducer 在这些流上靠 `agent_state_delta` 增量维护。前端首次拿到快照用于初始化 agent 状态 reducer。
 
 对标 AG-UI `STATE_SNAPSHOT`,作用域为 Agent 全局(不同于 `activity_snapshot` 的 plan 作用域)。不在 `_SSE_PROTOCOL_TAGS` 中加 `ag_ui_type` —— 与 `activity_snapshot` 共享同一 ag_ui_type 会引起前端 dispatcher 歧义。
 

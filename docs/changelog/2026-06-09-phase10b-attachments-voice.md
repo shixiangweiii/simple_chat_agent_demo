@@ -7,7 +7,7 @@
 ### 后端
 
 `demo/web_chat_agent.py`
-- 新增常量：`MAX_ATTACHMENTS_PER_TURN=5`、`MAX_ATTACHMENT_CHARS=20KB`（软上限，业务层截断）、`MAX_ATTACHMENT_HARD_CHARS=200KB`（HTTP 400）、`MAX_ATTACHMENT_TOTAL_CHARS=100KB`、`ALLOWED_ATTACHMENT_MIMES`（20 个严格白名单）
+- 新增常量：`MAX_ATTACHMENTS_PER_TURN=5`、`MAX_ATTACHMENT_CHARS=20KB`（软上限，业务层截断）、`MAX_ATTACHMENT_HARD_CHARS=100KB`（单文件硬上限，HTTP 400）、`MAX_ATTACHMENT_TOTAL_CHARS=100KB`、`ALLOWED_ATTACHMENT_MIMES`（20 个严格白名单）
 - 新增异常 `AttachmentPayloadInvalid(ValueError)`
 - 新增 `_validate_attachments(items)`：校验数量 / 三字段 / filename（无路径分隔符 / 控制字符 / Unicode 双向控制 / 不含 `..`）/ content（无 NUL / 字符上限 + UTF-8 字节上限）/ mime 严格白名单 / 总量上限
 - `ChatRequest` 加 `attachments: list[dict] | None`
@@ -59,7 +59,7 @@
 
 ## 关键设计决策（不可改回）
 
-1. **限额下调 100KB → 20KB**：原 roadmap 的 100KB × 5 = 50万字符 ≈ 15-20 万 token，超 qwen3-max 默认 32K 输入。下调到 20KB（软）+ 100KB 总（硬），可控在 ~30k token 内
+1. **限额下调 100KB → 20KB**：原 roadmap 的 100KB × 5 = 50万字符 ≈ 15-20 万 token，超 qwen3-max 默认 32K 输入。下调到 20KB（软）+ 单文件硬 100KB + 总量硬 100KB，可控在 ~30k token 内
 2. **注入顺序：user_input 在前，附件在后**：LLM 注意力对消息尾部更敏感，但短问题永远应放消息**首部**，避免被长附件淹没
 3. **`_validate_attachments` 安全校验深度**：不仅查路径分隔符，还查 `..`、控制字符（0x00-0x1F, 0x7F）、Unicode 双向控制字符（`U+202A`-`U+202E`）；NUL 字节拒绝；mime 严格白名单（不用 `startswith("text/")`）
 4. **`attachImages` 不重命名**：新建 `attachFiles` 并行函数，`dispatchSelectedFiles` 入口分流；改动半径小，命名语义清晰

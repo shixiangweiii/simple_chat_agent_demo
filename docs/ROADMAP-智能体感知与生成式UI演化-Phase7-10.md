@@ -251,7 +251,7 @@ class SteerRequest(BaseModel):
 - 文件大小限制：20KB / 文件（软上限，超过的业务层截断并提醒），最多 5 个，总量 ≤ 100KB
 
 > **实际实施备注（2026-06-09）**：
-> - 单文件上限从设计文档的 100KB 下调到 **20KB**(软截断)、硬 **200KB**(HTTP 400)，总量上限 **100KB**。原因：5×100KB ≈ 50 万字符 ≈ 15–20 万 token，已超 qwen3-max 默认上下文窗口（32K 输入），下调后可控在 ~30k token 内。超长附件截断后 prompt 教模型主动告知用户哪些部分不可见。
+> - 单文件软截断上限 **20KB**(`MAX_ATTACHMENT_CHARS`,业务层截断)、单文件硬上限 **100KB**(`MAX_ATTACHMENT_HARD_CHARS`,HTTP 400)，总量硬上限 **100KB**(`MAX_ATTACHMENT_TOTAL_CHARS`)。原因：设计文档原值 5×100KB ≈ 50 万字符 ≈ 15–20 万 token，已超 qwen3-max 默认上下文窗口（32K 输入），下调后可控在 ~30k token 内。超长附件截断后 prompt 教模型主动告知用户哪些部分不可见。（注：单文件硬上限与总量上限同为 100KB，单文件硬限实际由总量限先兜住。）
 > - 注入位置改为 user_input **之后**（非之前），避免长附件挤占短问题的注意力。
 > - `dispatchSelectedFiles` 按 file.type 分流到 `attachImages` / `attachFiles` 两个独立数组，**不重命名** `attachImages` 减少改动半径。
 

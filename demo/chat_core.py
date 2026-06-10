@@ -97,6 +97,18 @@ def _looks_dangerous(cmd: str) -> str | None:
     return None
 
 
+async def _wait_proc_bounded(proc, timeout: float = 2.0) -> None:
+    """有界等待子进程退出,超时再发一次 kill,绝不无限挂起。
+
+    单独抽出来是因为 H1 修复后有多处需要"等子进程收尾但不能裸 await proc.wait()"——
+    裸 wait 在子进程阻塞于写满的管道时会永久挂起,拖死持有 session lock 的协程。
+    """
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+
+
 async def _execute_shell_real(cmd: str) -> str:
     """真正执行 shell 命令并返回拼装好的 tool_result 字符串。
 
@@ -124,31 +136,45 @@ async def _execute_shell_real(cmd: str) -> str:
         logger.exception("shell spawn failed: %s", cmd)
         return f"[执行失败] 无法启动子进程: {e}"
 
-    # 有界读取:只从 stdout 管道读 MAX+1 字节作探针,内存峰值 ~8KB 而不是无界。
-    # 不用 proc.communicate() —— 它会把全部 stdout 读进内存,遇到 `yes` 等
-    # 高速产出命令时 30s 窗口内能堆 GB 级数据,直接 OOM 整个 server。
+    # 有界循环读取:累计到 MAX+1 字节即止,内存峰值 ~8KB 而不是无界。
+    # 关键 —— StreamReader.read(n) 只要缓冲区有任意数据就立即返回(最多 n 字节),
+    # 不会等够 n 字节。所以必须循环读直到 EOF 或超出上限,否则分多次产出的命令
+    # (find / 长 ls)第一片就返回会被误判为"完整输出"而静默丢数据。
+    # 整个读取共享一个 30s 总时限预算,每次 read 用剩余预算做超时,
+    # 避免子进程写满管道阻塞时协程永久挂起。
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SHELL_EXEC_TIMEOUT_SEC
+    buf = bytearray()
+    truncated = False
     try:
-        raw = await asyncio.wait_for(
-            proc.stdout.read(SHELL_EXEC_OUTPUT_MAX_CHARS + 1),
-            timeout=SHELL_EXEC_TIMEOUT_SEC,
-        )
+        while True:
+            need = SHELL_EXEC_OUTPUT_MAX_CHARS + 1 - len(buf)
+            if need <= 0:
+                truncated = True
+                break
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            piece = await asyncio.wait_for(proc.stdout.read(need), timeout=remaining)
+            if not piece:  # EOF
+                break
+            buf.extend(piece)
     except asyncio.TimeoutError:
         proc.kill()
-        await proc.wait()
+        await _wait_proc_bounded(proc)
         logger.warning("shell timeout after %ss: %s", SHELL_EXEC_TIMEOUT_SEC, cmd)
         return f"[超时] 命令执行超过 {SHELL_EXEC_TIMEOUT_SEC}s,已强制终止: {cmd}"
 
-    raw_len = len(raw)
-    truncated = raw_len > SHELL_EXEC_OUTPUT_MAX_CHARS
     if truncated:
-        # 还有未读字节 → 命令仍可能在产出 → 杀掉进程止血,管道里剩余数据随进程关闭自动 GC
+        # 还有未读字节 → 命令仍可能在产出 → 杀掉进程止血,管道剩余数据随进程关闭 GC
         proc.kill()
-        await proc.wait()
-        text = raw[:SHELL_EXEC_OUTPUT_MAX_CHARS].decode("utf-8", errors="replace")
+    # 始终走有界 wait(即便正常 EOF):避免 stderr 合流等边角情况下 proc.wait() 久挂
+    await _wait_proc_bounded(proc)
+
+    raw_len = len(buf)
+    text = bytes(buf[:SHELL_EXEC_OUTPUT_MAX_CHARS]).decode("utf-8", errors="replace")
+    if truncated:
         text += "\n...(输出过长,已截断)"
-    else:
-        await proc.wait()
-        text = raw.decode("utf-8", errors="replace")
 
     logger.info(
         "shell exec done: exit=%s out_bytes=%d truncated=%s cmd=%s",
@@ -2280,12 +2306,30 @@ async def _stream_react_rounds(
                 })
 
             if tc["name"] == "create_plan":
+                # H2: 同轮并行的其余 tool_calls 必须各补一条 role=tool,否则计划执行时
+                # execution_messages 违反 OpenAI "assistant.tool_calls 后每个 id 必须有
+                # 对应 role=tool" 约束被上游 400 —— plan_confirm 路径只补 create_plan 这一条,
+                # 不像 HITL resume 会消费 remaining_tool_calls。这里先消化掉剩余调用。
+                #
+                # 必须在 _register_plan **之前** stub + 清空(而非成功后):_register_plan 内部
+                # 会 _save_runtime_state,stub 晚于它会导致 restart-before-confirm 的 sidecar
+                # 缺 tool 响应 → 400。代价:create_plan 校验失败(下方 except continue)时,
+                # 剩余并行工具也被跳过而非执行,模型可下一轮重新发起 —— 这是刻意取舍。
+                # **不要**改成"成功才 stub"或"不清空 accumulated_tool_calls":前者引入 restart
+                # 窗口 400,后者让失败路径重复 pop 剩余调用产生 duplicate tool_call_id 响应。
+                for leftover in accumulated_tool_calls:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": leftover["id"],
+                        "content": "（已提交计划待用户确认，本轮其余并行工具调用跳过）",
+                    })
+                accumulated_tool_calls = []
                 pending_state = {
                     "user_input": user_input,
                     "messages": messages,
                     "tools": tools,
                     "round_num": round_num,
-                    "remaining_tool_calls": accumulated_tool_calls,
+                    "remaining_tool_calls": [],
                     "tool_call_id": tc["id"],
                 }
                 try:
@@ -2967,11 +3011,16 @@ def ui_action_response(
 # ============================================================
 
 def steer_response(session_id: str, message: str) -> dict:
-    """把用户的纠偏指令入队, 由当前/下次 ReAct 流在轮次边界消费。
+    """把用户的纠偏指令入队, 由当前活跃流或下一条 resume/plan 流在轮次边界消费。
 
     **关键设计**: 本函数立即返回 dict (非 SSE 流), 且不获取 _SESSION_LOCKS ——
-    否则与正在持有锁的 SSE 流死锁。允许无活跃流时入队 (等待下一次 /api/chat 消费),
-    简化前端时序; 也允许同一活跃流期间入队多条 (单 turn drain 时一并消费)。
+    否则与正在持有锁的 SSE 流死锁。允许同一活跃流期间入队多条 (单 turn drain 时一并消费)。
+
+    **消费范围 (与实现一致, 不要误读)**: 入队的 steer 由**当前活跃的 _stream_react_rounds /
+    _stream_plan_step_rounds**, 或下一条 /api/resume、/api/plan_* 流消费。
+    **新发起的 /api/chat 会主动丢弃**残留的未消费 steer (见 _stream_chat_native 的
+    Phase 9 fix B2) —— 避免上一轮的过期纠偏污染全新对话。因此本函数返回的
+    {queued: true} 仅表示"已入队", **不保证一定被消费** (若其后第一个动作是 fresh chat 则丢弃)。
 
     raises:
         SteerUnavailable: 非 chat 模式 / message 非空校验失败

@@ -323,6 +323,20 @@ async def _sse_stream(
         yield sse(event_name, _with_protocol_tags(event_name, payload))
 
 
+def _reject_if_busy(session_id: str) -> None:
+    """M4: 若该 session 已有活跃 SSE 流持锁,直接 409 拒绝。
+
+    必须在调用会修改共享状态的业务 sync 外壳(resume_chat_response /
+    plan_*_response 等弹 _PENDING / 改 plan 状态)**之前**调用 —— 否则并发请求会
+    在锁外裸改另一条活跃流正依赖的状态。`lock.locked()` 检查到 sync 外壳之间无
+    await 点,对"已有流持锁"的并发是原子拦截。残留极窄窗口见 CLAUDE.md Phase 7a M6。
+
+    session_id 合法性不在此校验(get_session_lock 不校验),由下游业务函数兜底翻译为 400。
+    """
+    if get_session_lock(session_id).locked():
+        raise HTTPException(status_code=409, detail="session busy: another stream is active")
+
+
 # ============================================================
 # 路由
 # ============================================================
@@ -354,6 +368,7 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
         memory = get_or_load(req.session_id)
     except InvalidSessionId:
         raise HTTPException(status_code=400, detail="invalid session_id")
+    _reject_if_busy(req.session_id)  # M4: 同 session 已有活跃流则 409
     if req.context is None:
         context = None
     elif hasattr(req.context, "model_dump"):
@@ -392,6 +407,7 @@ async def resume(req: ResumeRequest, request: Request) -> StreamingResponse:
 
     SSE 帧类型与 /api/chat 完全一致(含可能再次出现的 await_user)。
     """
+    _reject_if_busy(req.session_id)  # M4: 同 session 已有活跃流则 409,避免锁外裸改 _PENDING
     try:
         events = resume_chat_response(
             req.session_id,
@@ -423,6 +439,7 @@ async def resume(req: ResumeRequest, request: Request) -> StreamingResponse:
 @app.post("/api/ui_action")
 async def ui_action(req: UiActionRequest, request: Request) -> StreamingResponse:
     """声明式 UI button action 回传:校验后新启一条 SSE 流继续 ReAct。"""
+    _reject_if_busy(req.session_id)  # M4: 同 session 已有活跃流则 409
     try:
         events = ui_action_response(
             req.session_id,
@@ -459,6 +476,7 @@ async def ui_action(req: UiActionRequest, request: Request) -> StreamingResponse
 @app.post("/api/plan_confirm")
 async def plan_confirm(req: PlanConfirmRequest, request: Request) -> StreamingResponse:
     """用户确认/编辑计划后,新启 SSE 流逐步执行计划。"""
+    _reject_if_busy(req.session_id)  # M4: 同 session 已有活跃流则 409,避免锁外裸改 plan 状态
     try:
         events = plan_confirm_response(
             req.session_id,
@@ -493,6 +511,7 @@ async def plan_confirm(req: PlanConfirmRequest, request: Request) -> StreamingRe
 @app.post("/api/plan_decision")
 async def plan_decision(req: PlanDecisionRequest, request: Request) -> StreamingResponse:
     """计划步骤失败后的跳过/重试/修改后继续。"""
+    _reject_if_busy(req.session_id)  # M4: 同 session 已有活跃流则 409,避免锁外裸改 plan 状态
     try:
         events = plan_decision_response(
             req.session_id,
@@ -529,6 +548,7 @@ async def plan_decision(req: PlanDecisionRequest, request: Request) -> Streaming
 @app.post("/api/plan_continue")
 async def plan_continue(req: PlanContinueRequest, request: Request) -> StreamingResponse:
     """恢复 running plan 的执行流。"""
+    _reject_if_busy(req.session_id)  # M4: 同 session 已有活跃流则 409,避免锁外裸改 plan 状态
     try:
         events = plan_continue_response(
             req.session_id,
