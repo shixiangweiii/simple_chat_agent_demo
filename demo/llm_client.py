@@ -22,6 +22,7 @@ import os
 import time
 from typing import AsyncGenerator
 
+import httpx  # openai 的传递依赖,已在 .venv;rerank 走裸 HTTP(非 OpenAI SDK 方法)
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,27 @@ if _API_MODE_RAW not in _VALID_API_MODES:
         "用法: export API_MODE=chat 或 export API_MODE=responses"
     )
 API_MODE = _API_MODE_RAW
+
+# 跨会话长期记忆(Phase 11)用到的三类底层模型调用:
+# - complete: 无工具一次性补全,用于事实抽取 / 协调。**不带 web_search / enable_search**,
+#             避免抽取时误触发联网搜索;与 API_MODE 解耦(始终走 chat.completions)。
+# - embedding: text-embedding-v4(Qwen3-Embedding),OpenAI 兼容 client.embeddings.create,
+#              与 LLM 共用同一 compatible-mode 网关与 client 单例。
+# - rerank:   qwen3-rerank,**不是** OpenAI SDK 方法,需裸 HTTP POST 到 compatible-api 路径
+#             (与 embedding/chat 的 compatible-mode 不同路径)。
+EMBED_MODEL = os.environ.get("QWEN_EMBED_MODEL", "text-embedding-v4")
+EMBED_DIM = int(os.environ.get("QWEN_EMBED_DIM", "512"))  # 512 平衡检索质量与 JSON 体积
+EMBED_BATCH_MAX = 10  # text-embedding-v3/v4 单次最多 10 条
+RERANK_MODEL = os.environ.get("QWEN_RERANK_MODEL", "qwen3-rerank")  # gte-rerank 2026-05-30 下线
+RERANK_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
+
+# 长期记忆抽取/协调用的模型(L1):默认复用主 MODEL(零行为变化),成本敏感时可单独指向
+# 更便宜的模型(如 export QWEN_LTM_MODEL=qwen-plus)。抽取是结构化小任务,不必用最贵的旗舰模型。
+LTM_MODEL = os.environ.get("QWEN_LTM_MODEL", MODEL)
+# 长期记忆三类调用的请求超时(L2):抽取/协调持全局 _LTM_LOCK,给硬超时把最坏锁持有时长
+# 从 OpenAI client 默认(分钟级)压到秒级,避免一次卡死的调用长时间阻塞 delete / 下一次 ingest。
+LTM_COMPLETE_TIMEOUT = float(os.environ.get("QWEN_LTM_COMPLETE_TIMEOUT", "60"))
+LTM_EMBED_TIMEOUT = float(os.environ.get("QWEN_LTM_EMBED_TIMEOUT", "30"))
 
 
 # ============================================================
@@ -921,3 +943,152 @@ async def _llm_stream_chat_with_tools(
         finish_reason = getattr(choices[0], "finish_reason", None)
         if finish_reason and finish_reason not in ("stop", "tool_calls"):
             logger.warning("LLM 响应 finish_reason=%s(非 stop/tool_calls)", finish_reason)
+
+
+# ============================================================
+# Phase 11 长期记忆 —— 无工具一次性补全 (extract / reconcile 用)
+# ============================================================
+# 与 llm()/llm_chat_with_tools() 的区别:
+#   - 非流式 (stream=False),一次拿完整文本即可,抽取/协调不需要逐字 UI 反馈;
+#   - **不带 tools / 不带 enable_search**,避免抽取时模型误触发联网搜索;
+#   - 始终走 chat.completions,与 API_MODE 解耦 (responses 模式的部署也能用)。
+
+def complete(prompt: str, *, temperature: float = 0.0) -> str:
+    """同步无工具补全(长期记忆抽取/协调专用)。返回最终文本。失败抛异常,由上层兜底。
+
+    用 LTM_MODEL(默认 = 主 MODEL,可单独配更便宜的模型)+ LTM_COMPLETE_TIMEOUT 硬超时
+    (把持锁的最坏时长压到秒级)。
+    """
+    client = _get_client()
+    started_at = time.monotonic()
+    resp = client.chat.completions.create(
+        model=LTM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        stream=False,
+        timeout=LTM_COMPLETE_TIMEOUT,
+    )
+    choices = getattr(resp, "choices", None) or []
+    content = ""
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = (getattr(message, "content", None) or "") if message is not None else ""
+    logger.info(
+        "complete 结束:elapsed=%.0fms model=%s prompt_chars=%d content_chars=%d",
+        (time.monotonic() - started_at) * 1000, LTM_MODEL, len(prompt), len(content),
+    )
+    return content
+
+
+async def complete_async(prompt: str, *, temperature: float = 0.0) -> str:
+    """异步无工具补全 —— 把阻塞的 complete() 丢到线程池,避免阻塞事件循环。"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: complete(prompt, temperature=temperature))
+
+
+# ============================================================
+# Phase 11 长期记忆 —— 向量 embedding + rerank 精排 (检索层)
+# ============================================================
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """同步批量 embedding。返回与 texts 等长、同序的向量列表。
+
+    OpenAI 兼容路径 (与 chat 共用 client 单例)。单次最多 EMBED_BATCH_MAX 条,超出分批。
+    失败抛异常,由上层 (longterm_memory) 兜底为"不写向量,走降级"。
+    """
+    if not texts:
+        return []
+    client = _get_client()
+    out: list[list[float]] = []
+    for i in range(0, len(texts), EMBED_BATCH_MAX):
+        batch = texts[i:i + EMBED_BATCH_MAX]
+        resp = client.embeddings.create(
+            model=EMBED_MODEL, input=batch, dimensions=EMBED_DIM, encoding_format="float",
+            timeout=LTM_EMBED_TIMEOUT,  # L2: 硬超时,bound 持锁时长
+        )
+        # data[].index 是 batch 内序号,排序后还原输入顺序
+        items = sorted(resp.data, key=lambda d: getattr(d, "index", 0))
+        out.extend(list(d.embedding) for d in items)
+    return out
+
+
+async def embed_texts_async(texts: list[str]) -> list[list[float]]:
+    """异步批量 embedding —— 阻塞调用丢线程池。"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: embed_texts(texts))
+
+
+def _parse_rerank_response(data: dict, n_docs: int) -> list[tuple[int, float]] | None:
+    """解析 qwen3-rerank 响应:results 在顶层 (失败响应只有 code/message)。"""
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list):
+        logger.warning("rerank 无 results 字段(可能失败响应): %s",
+                       (data or {}).get("message") or (data or {}).get("code") or data)
+        return None
+    out: list[tuple[int, float]] = []
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+        idx = r.get("index")
+        score = r.get("relevance_score")
+        if isinstance(idx, int) and 0 <= idx < n_docs:
+            try:
+                out.append((idx, float(score)))
+            except (TypeError, ValueError):
+                out.append((idx, 0.0))
+    return out or None
+
+
+def _rerank_body(query: str, documents: list[str], top_n: int) -> dict:
+    return {
+        "model": RERANK_MODEL,
+        "query": query,
+        "documents": documents,
+        "top_n": min(top_n, len(documents)),
+        # 长期记忆是对称语义匹配,用"语义相似度"指令而非"问答检索"
+        "instruct": "Retrieve semantically similar text.",
+    }
+
+
+def rerank(query: str, documents: list[str], top_n: int) -> list[tuple[int, float]] | None:
+    """同步 rerank。返回 [(原始 index, 分数)] 按相关性降序,或 None(任何失败 → 让上层降级)。"""
+    if not documents:
+        return None
+    key = os.environ.get("DASHSCOPE_API_KEY")
+    if not key:
+        logger.warning("rerank 跳过:未配置 DASHSCOPE_API_KEY")
+        return None
+    try:
+        resp = httpx.post(
+            RERANK_ENDPOINT,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=_rerank_body(query, documents, top_n),
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        return _parse_rerank_response(resp.json(), len(documents))
+    except Exception:
+        logger.warning("rerank 调用失败,降级", exc_info=True)
+        return None
+
+
+async def rerank_async(query: str, documents: list[str], top_n: int) -> list[tuple[int, float]] | None:
+    """异步 rerank(httpx.AsyncClient,真异步,不占线程池)。失败返回 None。"""
+    if not documents:
+        return None
+    key = os.environ.get("DASHSCOPE_API_KEY")
+    if not key:
+        logger.warning("rerank 跳过:未配置 DASHSCOPE_API_KEY")
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                RERANK_ENDPOINT,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=_rerank_body(query, documents, top_n),
+            )
+            resp.raise_for_status()
+            return _parse_rerank_response(resp.json(), len(documents))
+    except Exception:
+        logger.warning("rerank 调用失败,降级", exc_info=True)
+        return None

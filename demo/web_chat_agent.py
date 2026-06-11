@@ -46,11 +46,14 @@ from chat_core import (  # noqa: E402
     UiSurfaceNotFound,
     archive_session,
     confidence_decision,
+    delete_longterm_fact,
     delete_session,
     get_archive_path_if_exists,
     get_or_load,
     get_session_lock,
     list_sessions,
+    longterm_snapshot,
+    schedule_longterm_ingest,
     _with_protocol_tags,
     plan_confirm_response,
     plan_continue_response,
@@ -619,11 +622,18 @@ async def reset(req: ResetRequest) -> dict:
 
 @app.post("/api/archive")
 async def archive(req: ArchiveRequest) -> dict:
-    """覆盖式归档当前 session 的 Memory 到 markdown。空 Memory 跳过。"""
+    """覆盖式归档当前 session 的 Memory 到 markdown。空 Memory 跳过。
+
+    Phase 11: 归档成功后**后台**触发跨会话长期记忆摄入(create_task,不阻塞本响应);
+    前端面板下次刷新可见新沉淀的事实。
+    """
     try:
-        return archive_session(req.session_id)
+        result = archive_session(req.session_id)
     except InvalidSessionId:
         raise HTTPException(status_code=400, detail="invalid session_id")
+    if not result.get("skipped"):
+        schedule_longterm_ingest(req.session_id)
+    return result
 
 
 @app.get("/api/history")
@@ -664,6 +674,21 @@ async def session_raw(session_id: str) -> FileResponse:
     except HistoryNotFound:
         raise HTTPException(status_code=404, detail="archive not found")
     return FileResponse(path, media_type="text/markdown; charset=utf-8")
+
+
+@app.get("/api/longterm_memory")
+async def longterm_memory_list() -> dict:
+    """Phase 11: 跨会话长期记忆只读快照,供前端「🧠 记忆」面板渲染。"""
+    return longterm_snapshot()
+
+
+@app.delete("/api/longterm_memory/{fact_id}")
+async def longterm_memory_delete(fact_id: str) -> dict:
+    """Phase 11: 删除一条长期记忆事实。fact_id 形态非法 → 400。"""
+    result = await delete_longterm_fact(fact_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "invalid fact_id"))
+    return result
 
 
 if __name__ == "__main__":

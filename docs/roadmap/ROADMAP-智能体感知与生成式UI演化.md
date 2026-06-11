@@ -884,4 +884,6 @@ Phase 6 (Confidence Signal) ← 横切 responses/chat 两条最终回答路径
 
 主线 Phase 1-4 与 Future Direction 中的 Checkpoint/Resume、Confidence Signal 已完成。后续可继续从 Future Directions 中选择 AG-UI 协议对齐、Agent Steering 或多模态感知作为进阶扩展。
 
-> **更新（2026-06-09）**：Phase 7（质量修复 + AG-UI/A2UI 协议对齐）、Phase 8（流式 UI + 表单组件）、Phase 9（Agent Steering + state snapshot/delta）、Phase 10（多模态：图片 / 文本附件 / 语音输入）已全部落地，详见 `docs/ROADMAP-智能体感知与生成式UI演化-Phase7-10.md`。
+> **更新（2026-06-09）**：Phase 7（质量修复 + AG-UI/A2UI 协议对齐）、Phase 8（流式 UI + 表单组件）、Phase 9（Agent Steering + state snapshot/delta）、Phase 10（多模态：图片 / 文本附件 / 语音输入）已全部落地，详见 `docs/roadmap/ROADMAP-智能体感知与生成式UI演化-Phase7-10.md`。
+
+> **更新（2026-06-11）**：Phase 11（跨会话长期记忆）已落地 —— mem0 式原子事实抽取 + LLM 协调（ADD/UPDATE/DELETE）+ 全局 JSON 存储 + query-aware 注入（text-embedding-v4 召回 + qwen3-rerank 精排，本地 JSON 模拟向量库，带优雅降级阶梯）。在 session 隔离 Memory 之上叠加全局长期记忆，归档时后台批量摄入，注入到后续任意会话的 system prompt；`responses` / `chat` 两模式都生效。新模块 `demo/longterm_memory.py`，详见 `docs/changelog/2026-06-11-phase11-cross-session-memory.md`。

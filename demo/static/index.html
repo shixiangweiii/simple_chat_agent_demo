@@ -845,6 +845,16 @@
     animation: modal-fade-in 0.18s ease;
   }
   .modal-overlay[hidden] { display: none; }
+  /* Phase 11: 长期记忆面板 */
+  .ltm-group { margin: 0 0 18px; }
+  .ltm-group-title { font-size: 13px; font-weight: 600; color: var(--muted, #888); margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; }
+  .ltm-fact { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; margin-bottom: 6px; border: 1px solid var(--border, #2a2a2a); border-radius: 8px; }
+  .ltm-fact-body { flex: 1; min-width: 0; }
+  .ltm-fact-text { font-size: 14px; line-height: 1.5; word-break: break-word; }
+  .ltm-fact-meta { font-size: 11px; color: var(--muted, #888); margin-top: 4px; }
+  .ltm-fact-del { flex-shrink: 0; background: none; border: none; color: var(--muted, #888); cursor: pointer; font-size: 14px; padding: 2px 6px; border-radius: 4px; }
+  .ltm-fact-del:hover { color: #e5534b; background: rgba(229,83,75,.12); }
+  .ltm-empty { color: var(--muted, #888); text-align: center; padding: 40px 0; font-size: 14px; }
   @keyframes modal-fade-in {
     from { opacity: 0; transform: translateY(8px); }
     to   { opacity: 1; transform: translateY(0); }
@@ -1257,6 +1267,7 @@
         </div>
       </div>
       <div class="header-actions">
+        <button class="reset-btn" id="memory" title="查看跨会话长期记忆（从历史会话沉淀的关于你的事实）">🧠 记忆</button>
         <button class="reset-btn" id="archive" title="把当前会话写入磁盘归档(覆盖式)">归档</button>
         <button class="reset-btn" id="reset" title="清空当前会话内存与归档,session_id 保留">重置</button>
       </div>
@@ -1314,6 +1325,25 @@
       <div class="modal-pane modal-pane-source" id="archive-pane-source" hidden>
         <pre><code id="archive-source-code"></code></pre>
       </div>
+    </main>
+  </div>
+</div>
+
+<!-- Phase 11: 跨会话长期记忆面板 -->
+<div class="modal-overlay" id="memory-modal" hidden>
+  <div class="modal-fullscreen" role="dialog" aria-modal="true" aria-labelledby="memory-modal-title">
+    <header class="modal-topbar">
+      <div class="modal-title-group">
+        <h2 id="memory-modal-title">🧠 跨会话长期记忆</h2>
+        <span class="modal-meta" id="memory-modal-meta"></span>
+      </div>
+      <div class="modal-actions">
+        <button class="icon-btn" id="memory-modal-refresh" title="刷新">↻</button>
+        <button class="icon-btn modal-close" id="memory-modal-close" title="关闭(Esc)">✕</button>
+      </div>
+    </header>
+    <main class="modal-body" id="memory-modal-body">
+      <div class="modal-pane" id="memory-pane"></div>
     </main>
   </div>
 </div>
@@ -2416,6 +2446,10 @@
         else showToast('已归档');
       }
       await loadSessions();
+      // Phase 11: 摄入是后台异步的,事实非即时。若记忆面板正开着,延迟刷新一次。
+      if (!data.skipped && $memoryModal && !$memoryModal.hidden) {
+        setTimeout(loadMemoryFacts, 2500);
+      }
       return data;
     } catch (e) {
       if (!silent) showToast('归档失败: ' + e.message, true);
@@ -3890,6 +3924,15 @@
   const $archiveModalDownload = document.getElementById('archive-modal-download');
   const $archiveModalTabs     = $archiveModal.querySelectorAll('.modal-tab');
 
+  // Phase 11: 长期记忆面板 refs
+  const $memoryBtn         = document.getElementById('memory');
+  const $memoryModal       = document.getElementById('memory-modal');
+  const $memoryModalMeta   = document.getElementById('memory-modal-meta');
+  const $memoryPane        = document.getElementById('memory-pane');
+  const $memoryModalClose  = document.getElementById('memory-modal-close');
+  const $memoryModalRefresh= document.getElementById('memory-modal-refresh');
+  let memoryPrevFocus = null;
+
   let archiveModalRaw = '';
   let archivePrevFocus = null;
 
@@ -4046,6 +4089,108 @@
     a.download = `${(SESSION_ID || 'session').slice(0, 8)}.md`;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 200);
+  });
+
+  // ---------- Phase 11: 跨会话长期记忆面板 ----------
+  const LTM_CAT_LABELS = { preference: '偏好', identity: '身份', project: '项目', fact: '事实' };
+  const LTM_CAT_ORDER = ['preference', 'identity', 'project', 'fact'];
+
+  function renderMemoryFacts(snapshot) {
+    $memoryPane.innerHTML = '';
+    const facts = (snapshot && Array.isArray(snapshot.facts)) ? snapshot.facts : [];
+    $memoryModalMeta.textContent = `共 ${facts.length} 条`;
+    if (facts.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'ltm-empty';
+      empty.textContent = '还没有跨会话记忆。归档几次对话后，关于你的事实会自动沉淀在这里。';
+      $memoryPane.appendChild(empty);
+      return;
+    }
+    // 按 category 分组（已知顺序在前，未知归到末尾）
+    const groups = new Map();
+    for (const f of facts) {
+      const cat = LTM_CAT_LABELS[f.category] ? f.category : '_other';
+      if (!groups.has(cat)) groups.set(cat, []);
+      groups.get(cat).push(f);
+    }
+    const orderedCats = [...LTM_CAT_ORDER.filter(c => groups.has(c)), ...(groups.has('_other') ? ['_other'] : [])];
+    for (const cat of orderedCats) {
+      const group = document.createElement('div');
+      group.className = 'ltm-group';
+      const title = document.createElement('div');
+      title.className = 'ltm-group-title';
+      title.textContent = LTM_CAT_LABELS[cat] || '其它';
+      group.appendChild(title);
+      for (const f of groups.get(cat)) {
+        const row = document.createElement('div');
+        row.className = 'ltm-fact';
+        const body = document.createElement('div');
+        body.className = 'ltm-fact-body';
+        const text = document.createElement('div');
+        text.className = 'ltm-fact-text';
+        text.textContent = f.text || '';   // 用户派生内容：textContent，不过 markdown（XSS 边界）
+        const meta = document.createElement('div');
+        meta.className = 'ltm-fact-meta';
+        const nSrc = Array.isArray(f.source_sessions) ? f.source_sessions.length : 0;
+        meta.textContent = `更新于 ${(f.updated_at || '').replace('T', ' ').slice(0, 16)} · 来自 ${nSrc} 个会话`;
+        body.appendChild(text); body.appendChild(meta);
+        const del = document.createElement('button');
+        del.className = 'ltm-fact-del';
+        del.title = '删除这条记忆';
+        del.textContent = '✕';
+        del.addEventListener('click', () => deleteMemoryFact(f.id));
+        row.appendChild(body); row.appendChild(del);
+        group.appendChild(row);
+      }
+      $memoryPane.appendChild(group);
+    }
+  }
+
+  async function loadMemoryFacts() {
+    try {
+      const resp = await fetch('/api/longterm_memory');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      renderMemoryFacts(await resp.json());
+    } catch (e) {
+      $memoryPane.innerHTML = '';
+      const err = document.createElement('div');
+      err.className = 'ltm-empty';
+      err.textContent = '加载记忆失败: ' + e.message;
+      $memoryPane.appendChild(err);
+    }
+  }
+
+  async function deleteMemoryFact(factId) {
+    if (!factId || !confirm('删除这条长期记忆？')) return;
+    try {
+      const resp = await fetch('/api/longterm_memory/' + encodeURIComponent(factId), { method: 'DELETE' });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      showToast('已删除');
+      await loadMemoryFacts();
+    } catch (e) {
+      showToast('删除失败: ' + e.message, true);
+    }
+  }
+
+  function openMemoryPanel() {
+    memoryPrevFocus = document.activeElement;
+    $memoryModal.hidden = false;
+    document.body.classList.add('modal-open');
+    $memoryModalClose.focus();
+    loadMemoryFacts();
+  }
+
+  function closeMemoryPanel() {
+    $memoryModal.hidden = true;
+    document.body.classList.remove('modal-open');
+    if (memoryPrevFocus && memoryPrevFocus.focus) memoryPrevFocus.focus();
+  }
+
+  $memoryBtn.addEventListener('click', openMemoryPanel);
+  $memoryModalClose.addEventListener('click', closeMemoryPanel);
+  $memoryModalRefresh.addEventListener('click', loadMemoryFacts);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !$memoryModal.hidden) closeMemoryPanel();
   });
 
   init();

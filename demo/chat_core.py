@@ -33,6 +33,7 @@ from llm_client import (  # noqa: E402,F401
     llm_stream_chat_with_tools,
 )
 import mcp_web_search  # noqa: E402
+import longterm_memory  # noqa: E402  跨会话长期记忆(Phase 11),向下依赖,不反向 import chat_core
 
 logger = logging.getLogger(__name__)
 
@@ -1036,6 +1037,57 @@ def get_archive_path_if_exists(session_id: str) -> Path:
 
 def session_count() -> int:
     return len(sessions)
+
+
+# ============================================================
+# 跨会话长期记忆 —— 薄 re-export(让 HTTP 层只依赖 chat_core,守住分层)
+# ============================================================
+
+# 持有后台摄入任务的强引用:asyncio 只对 task 保持弱引用,未被引用的 task 可能在
+# 完成前被 GC 掉(官方文档明确警告)。完成后用 done_callback 自动移除。
+_LTM_INGEST_TASKS: set = set()
+
+
+def schedule_longterm_ingest(session_id: str) -> None:
+    """归档后台摄入:快照当前会话 turns,fire-and-forget create_task,不阻塞归档响应。
+
+    必须在 async 上下文调用(/api/archive 路由满足)。turns 在调度时即快照,避免任务
+    实际运行时会话被 mutate/evict;任务体异常只 log。多会话并发摄入由 longterm_memory
+    内部 _LTM_LOCK + 水位线串行/去重。
+    """
+    try:
+        memory = get_or_load(session_id)
+        turns = [dict(m) for m in memory.memories]
+    except Exception:
+        logger.warning("schedule_longterm_ingest 快照失败: %s", session_id, exc_info=True)
+        return
+    if not turns:
+        return
+
+    async def _run():
+        try:
+            await longterm_memory.ingest_async(session_id, turns)
+        except Exception:
+            logger.warning("长期记忆后台摄入异常: %s", session_id, exc_info=True)
+
+    try:
+        task = asyncio.create_task(_run())
+    except RuntimeError:
+        logger.warning("无运行中的事件循环,跳过长期记忆摄入: %s", session_id)
+        return
+    # 强引用直到任务完成,防止 task 被 GC 中途取消
+    _LTM_INGEST_TASKS.add(task)
+    task.add_done_callback(_LTM_INGEST_TASKS.discard)
+
+
+def longterm_snapshot() -> dict:
+    """前端「记忆」面板用的只读快照。"""
+    return longterm_memory.snapshot()
+
+
+async def delete_longterm_fact(fact_id: str) -> dict:
+    """删除一条长期记忆事实(用户在面板操作)。"""
+    return await longterm_memory.delete_fact_async(fact_id)
 
 
 # ============================================================
@@ -2071,7 +2123,8 @@ def _react_chat_native(memory: Memory, user_input: str) -> str:
     与 react() 等价契约:返回最终答复文本字符串(由 common_chat_agent.main 写回 Memory)。
     内部维护一个本地 messages 数组承载 tool_calls / tool_call_id 链接,循环结束就丢弃。
     """
-    messages = _memory_to_messages(memory, USER_PROMPT, user_input)
+    # Phase 11: CLI chat 模式被动注入长期记忆(同步全量),作为 system prompt 附加片段。
+    messages = _memory_to_messages(memory, USER_PROMPT, user_input, longterm_memory.injection_fragment())
     try:
         tools = _build_native_tools()
     except Exception as exc:
@@ -3188,8 +3241,10 @@ def react(memory: Memory, latest_input: str) -> str:
     if API_MODE == "chat":
         return _react_chat_native(memory, latest_input)
 
+    # Phase 11: CLI 被动注入长期记忆(同步全量,不接检索);算一次,各轮复用。
+    ltm_fragment = longterm_memory.injection_fragment()
     for round_num in range(MAX_ROUNDS):
-        prompt = build_prompt(USER_PROMPT, TOOLS, memory, latest_input)
+        prompt = build_prompt(USER_PROMPT, TOOLS, memory, latest_input, ltm_fragment)
         logger.info("ReAct 第 %d 轮开始:prompt_chars=%d latest_input_chars=%d memory_turns=%d",
                     round_num, len(prompt), len(latest_input), len(memory.memories))
         logger.info("prompt=\n%s", prompt)
@@ -3266,6 +3321,15 @@ async def stream_agent_response(
     # 仅 chat 模式 (responses 模式不参与 Phase 3+ 新功能, 与一贯约束一致)。
     if API_MODE == "chat" and session_id:
         yield ("agent_state_snapshot", _agent_state_payload(session_id, round_num=0))
+
+    # Phase 11: 跨会话长期记忆注入 —— query-aware 检索(事实少则全量),与 adaptive_fragment
+    # 并入同一 system-prompt 附加片段(零下游签名改动)。检索内部带降级阶梯,绝不抛。
+    # responses / chat 两种 API_MODE 都走这里;resume / plan 流复用已烘焙的 system message,无需重注入。
+    # 放在首帧(snapshot/ui_hint)之后,让前端先收到首帧,不被 embed+rerank 网络往返阻塞;
+    # 已断连则跳过检索(省 embed/rerank 调用),下游 _stream_* 仍会再次探测断连并退出。
+    if not await is_disconnected():
+        ltm_fragment = await longterm_memory.retrieve_injection_async(user_input)
+        adaptive_fragment = "\n\n".join(s for s in (ltm_fragment, adaptive_fragment) if s)
 
     if API_MODE == "chat":
         async for event in _stream_chat_native(
