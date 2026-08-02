@@ -22,11 +22,33 @@ The demo is split into three layers under `demo/` (HTTP / 业务 / LLM 底层) �
 - Run CLI: `export DASHSCOPE_API_KEY=sk-xxx && python demo/common_chat_agent.py`
 - Run Web: `export DASHSCOPE_API_KEY=sk-xxx && python demo/web_chat_agent.py`, then open `http://127.0.0.1:8000`.
 
+**Full env var reference** — every variable the code actually reads, with its default and definition site. The `LTM_*` / embed / rerank group is explained in "跨会话长期记忆（Phase 11）" below; this table is just the index.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `DASHSCOPE_API_KEY` | *(required)* | LLM calls; both entry points refuse to start without it |
+| `DASHSCOPE_API_KEY_MCP` | falls back to `DASHSCOPE_API_KEY` | MCP tool calls, `API_MODE=chat` only |
+| `QWEN_MODEL` | `qwen3.7-max` | `llm_client.py:36`. Set `qwen-vl-max` for Phase 10a images |
+| `API_MODE` | `responses` | `llm_client.py:45`. `responses` \| `chat` |
+| `ALLOW_REAL_SHELL` | `0` | `chat_core.py:76`. `1` = HITL-approved `execute_shell_command` really executes |
+| `QWEN_EMBED_MODEL` | `text-embedding-v4` | `llm_client.py:61` |
+| `QWEN_EMBED_DIM` | `512` | `llm_client.py:62` |
+| `QWEN_RERANK_MODEL` | `qwen3-rerank` | `llm_client.py:64` |
+| `QWEN_LTM_MODEL` | = `MODEL` | `llm_client.py:69`. Point at a cheaper model to cut ingest cost |
+| `QWEN_LTM_COMPLETE_TIMEOUT` | `60` | `llm_client.py:72` (seconds) |
+| `QWEN_LTM_EMBED_TIMEOUT` | `30` | `llm_client.py:73` (seconds) |
+| `LTM_MIN_TURNS` | `2` | `longterm_memory.py:52` |
+| `LTM_MAX_FACTS` | `200` | `longterm_memory.py:53` |
+| `LTM_MAX_INJECT_CHARS` | `2000` | `longterm_memory.py:54` |
+| `LTM_INJECT_ALL_MAX` | `12` | `longterm_memory.py:55` |
+| `LTM_RECALL_TOP_N` | `20` | `longterm_memory.py:56` |
+| `LTM_RERANK_TOP_K` | `6` | `longterm_memory.py:57` |
+
 The LLM endpoint is hardcoded to Alibaba DashScope's OpenAI-compatible gateway (`https://dashscope.aliyuncs.com/compatible-mode/v1`). Changing provider means editing `_build_client()` in `demo/llm_client.py` (the only module that imports the OpenAI SDK).
 
 There is no test suite, linter, or build step configured. `scripts/debug_responses.py` is a standalone troubleshooting script that dumps every raw chunk type from a `client.responses.create` stream (useful when DashScope returns empty/odd responses).
 
-`docs/` holds reference material, not runtime code: DashScope API docs (Chat / Responses / Function Calling / WebSearch MCP), the authoritative SSE contract spec (`docs/SSE事件契约.md` — more detailed than the summary table below, including AG-UI/A2UI tag fields per event), A2UI protocol notes (`docs/A2UI/`), roadmaps, and `docs/changelog/`.
+`docs/` holds reference material, not runtime code: DashScope API docs (`docs/外部接口文档/` — Chat / Responses / Function Calling / WebSearch MCP / Rerank), the authoritative SSE contract spec (`docs/调研/SSE事件契约.md` — more detailed than the summary table below, including AG-UI/A2UI tag fields per event), and A2UI protocol notes (`docs/A2UI/`).
 
 ## Architecture
 
@@ -218,7 +240,7 @@ Serialization lives on `Memory.to_markdown(session_id)` / `Memory.from_markdown(
 
 ### SSE event contract
 
-All payloads are JSON. The HTTP layer's `_sse_stream` additionally injects AG-UI / A2UI protocol-tag fields (`ag_ui_type` / `a2ui_type`) per event via `chat_core._with_protocol_tags` (Phase 7b) — the table below shows business payloads only; the full per-event spec including tags is `docs/SSE事件契约.md`.
+All payloads are JSON. The HTTP layer's `_sse_stream` additionally injects AG-UI / A2UI protocol-tag fields (`ag_ui_type` / `a2ui_type`) per event via `chat_core._with_protocol_tags` (Phase 7b) — the table below shows business payloads only; the full per-event spec including tags is `docs/调研/SSE事件契约.md`.
 
 | event | payload | meaning |
 |---|---|---|
@@ -250,7 +272,7 @@ All payloads are JSON. The HTTP layer's `_sse_stream` additionally injects AG-UI
 
 - **The string-prompt + manual `Action:`/`Observation:` parsing 在 `responses` 模式与自定义 `TOOLS` 文本协议路径上是 intentional**, not legacy。仍然展示从字符串解析工具调用的 ReAct 教学点。`API_MODE=chat` 下联网搜索改走 OpenAI native `tools=[...]` / `tool_calls` 协议是教学目标的**扩展**,与老路径并存,展示两种工具调用范式的对照(prompt-engineered 文本协议 vs. API-native 结构化协议)。**两条路径共存,不要试图统一,也不要把 chat 模式的 native function calling 回退到字符串协议**。
 - **Memory 存储格式仍是一组 flat string** —— `Memory.memories` 永远是 `[{role, msg}, ...]`,序列化到 markdown 也是按 turn 拼出来的字符串。`responses` 模式下整段 Memory 拼成一个 prompt 字符串发给 LLM(`build_prompt` + `Memory.get_all`);`chat` 模式下 `_memory_to_messages` 把同一份 Memory **临时**转成 OpenAI messages 数组,**只为当次 LLM 调用使用**,turn 完成后只把 final assistant content 写回 Memory(`memory.add(USER, user_input)` + `memory.add(AI, content)`),tool_calls / tool_call_id 不进 Memory。这条 non-goal 维持不变 —— 持久化层的"flat string"教学点没改。
-- **`index.html` is one file with inline CSS + JS, ~4050 lines** (sidebar + persistence + anchor TOC + archive-preview modal + HITL bubble 渲染 + consumeStream/consumeResumeStream 流读取 + DeclarativeRenderer(含 Phase 8b 表单组件)+ plan 卡 + agentStateStore + steer UI + 多模态附件/语音输入)。Splitting into separate files makes it harder to read end-to-end; keep it one file.
+- **`index.html` is one file with inline CSS + JS, ~4199 lines** (sidebar + persistence + anchor TOC + archive-preview modal + HITL bubble 渲染 + consumeStream/consumeResumeStream 流读取 + DeclarativeRenderer(含 Phase 8b 表单组件)+ plan 卡 + agentStateStore + steer UI + 多模态附件/语音输入)。Splitting into separate files makes it harder to read end-to-end; keep it one file.
 
 ### Implications when modifying
 
@@ -277,7 +299,7 @@ All payloads are JSON. The HTTP layer's `_sse_stream` additionally injects AG-UI
 - **Phase 6 Confidence Signal**:system prompt 要求最终回答末尾输出 `[confidence: 0.0-1.0 | reason: ...]`;`chat_core` 用尾部缓冲剥离该 marker,再发送 `confidence_signal`。低置信度阈值是 `<0.55`,中置信度是 `<0.8`。低置信度回答不立即写入 Memory,而是注册 `_ANSWER_DRAFTS`;`POST /api/confidence_decision` 的 `accept` 才写入 Memory,`discard` 不写入。草稿不进入 runtime_state 或 archive。Phase 7a 对尾部缓冲做了三处加固:前缀门控(candidate 至少为 `[c` 才触发缓冲)、长度守卫(尾部超 `_CONFIDENCE_TAIL_MAX` 立即 flush,防短答案被整段缓冲)、流尾二次清理(截掉未闭合的 `[confidence` 前缀)。
 - **Phase 7 健壮性 & 协议标签**:
   - **7a 并发与恢复加固**:每 session 一把 `asyncio.Lock`(`get_session_lock`),所有 SSE 流路由在 HTTP 层 `async with lock` 串行化(`/api/steer` 除外,见 Phase 9);`reset_session` / `delete_session` 同步清理 `_SESSION_LOCKS` / `_STEER_QUEUES` / `_STEER_HISTORY`;runtime sidecar 恢复时 `running` plan 降级为 `paused` + 中断步标 `error`(经 `/api/plan_decision` retry/skip/update 恢复;`/api/plan_continue` 仅服务于"进程未重启、流断开但 plan 仍 `running`"场景),恢复失败可重试;归档时清理已完成 plan / 已处理 draft。
-  - **7b AG-UI/A2UI 协议标签**:`chat_core._SSE_PROTOCOL_TAGS` 把每个 SSE 事件映射到 AG-UI(`ag_ui_type`)/ A2UI(`a2ui_type`)对标字段,HTTP 层 `_sse_stream` 经 `_with_protocol_tags`(非变异)注入 payload。新增事件类型时同步登记标签映射(无对标可留空),并更新 `docs/SSE事件契约.md`。
+  - **7b AG-UI/A2UI 协议标签**:`chat_core._SSE_PROTOCOL_TAGS` 把每个 SSE 事件映射到 AG-UI(`ag_ui_type`)/ A2UI(`a2ui_type`)对标字段,HTTP 层 `_sse_stream` 经 `_with_protocol_tags`(非变异)注入 payload。新增事件类型时同步登记标签映射(无对标可留空),并更新 `docs/调研/SSE事件契约.md`。
 - **Phase 9 Agent Steering & 状态同步(仅 `chat` 模式生效)**:`_STEER_QUEUES: dict[str, asyncio.Queue]` 与 `_STEER_HISTORY: dict[str, list[dict]]`(上限 `_STEER_HISTORY_MAX=10`)是模块级**进程内** state,**不**持久化到 runtime sidecar(进程退出后未消费的 steer 无意义)。`get_steer_queue(session_id)` 与 `get_session_lock(session_id)` 同纲领(懒创建 accessor),消费侧与生产侧共用以保证 Queue 绑定到唯一事件循环。`POST /api/steer` 路由**不获取** `_SESSION_LOCKS`(否则与活跃 SSE 流死锁);它仅 `put_nowait` 后立即返回 dict(非 SSE 流),由当前活跃流或下一条 `/api/resume`、`/api/plan_*` 流在 `_stream_react_rounds` / `_stream_plan_step_rounds` 顶部 `_drain_steers` 消费,append 为 `{"role":"user","content":"[Steering] ..."}` 到 messages。**消费范围注意**:新发起的 `/api/chat` 会在 `_stream_chat_native` 入口主动**丢弃**残留未消费的 steer(Phase 9 fix B2),避免上一轮过期纠偏污染全新对话 —— `_STEER_HISTORY` 不清(那是跨 chat 累计供前端展示的历史)。`_can_append_user_message(messages)` 在 drain 前检查 OpenAI 顺序约束(`assistant.tool_calls` 后必须紧跟 `role=tool`),不满足时 steer 留队列等下轮。steer **不消耗 ReAct 轮次**。新增 SSE 事件 `steer_applied` / `agent_state_snapshot` / `agent_state_delta`:`agent_state_*` 与 `activity_*` 的作用域差异 —— 前者是 **Agent 全局态**纲要(round / tool_stats / surfaces 列表 / plans 列表 / pending / steer_history),后者是 **plan 作用域**详细步骤态;两者各有独立 AG-UI 标签,前端有独立 dispatcher,**不要互相替代**。`agent_state_delta` 是 RFC 6902 JSON Patch,但仅用 `replace` 和 `add(/array/-)` 两种 op;前端 reducer (`agentStateStore.applyPatch`) 也仅支持这两种。`/api/health` 返回 `api_mode` 字段供前端决定是否启用 steer 模式按钮(responses 模式下退化为旧"生成中..."禁用行为)。
 - **Phase 10a 多模态感知 — 图片上传(仅 `API_MODE=chat` 生效)**:`ChatRequest.images` 字段承载 base64 data URL 列表,沿调用链 `stream_agent_response → _stream_chat_native → _memory_to_messages` 透传。`_memory_to_messages` 在最后一条 user 节点若 `images` 非空,content 从 str 改为 vision list(`[{type:text}, {type:image_url}*N]`),其余链路零改动:历史 Memory 保持 str(D2)、`Memory.add` 签名不改(D3)、`llm_client._llm_stream_chat_with_tools` 零改动(因为 OpenAI SDK 对 str/list content 都原生支持)。`_validate_images`(总数 ≤ 3 / 每张 ≤ 5MB / 必须 `data:image/*`) 做 `web_chat_agent.py` 的 HTTP 边界校验,对应异常 `ImagePayloadInvalid → 400`。前端 `attachImages(files)` + `renderAttachedImages()` + 三路汇入(📎点击/拖拽/粘贴) + `send()` 携带 + `setStreaming()` 禁用联动。`responses` 模式不支持,`images` 非空时 yield `error` SSE 帧显式提示,不静默丢。CLI 路径零改动。**部署须知**:`export QWEN_MODEL=qwen-vl-max`(或 `qwen3-vl-plus`),否则 LLM 无法处理图片 vision content,会报错回 error SSE 帧。non-goals:不做服务端图片处理/responses 模式适配/图片进 Memory 归档/HITL resume 携带图。
 - **Phase 10b 多模态感知 — 文本文件附件(仅 `API_MODE=chat` 生效)**:`ChatRequest.attachments: list[dict] | None` 承载 `{filename, content, mime_type}` 列表,沿调用链 `stream_agent_response → _stream_chat_native → _memory_to_messages` 与 `images` 并行透传。`_memory_to_messages` 在最后一条 user 节点,把 `_build_attachment_block(attachments)` 拼出的 markdown 代码块**追加到 user_input 之后**(刻意不放前面 —— 长附件在前会把短问题挤出模型注意力窗口)。与 `images` 正交可共存。`_validate_attachments`(总数 ≤ 5 / 单文件硬上限 100KB(`MAX_ATTACHMENT_HARD_CHARS`)/ 总量硬上限 100KB / filename 拒绝路径分隔符+控制字符+Unicode 双向控制 / mime_type 严格白名单 `ALLOWED_ATTACHMENT_MIMES`) 在 `web_chat_agent.py` 做 HTTP 边界校验,对应异常 `AttachmentPayloadInvalid → 400`;**软上限 20KB / 文件**由业务层 `_build_attachment_block` 截断并加 `...(已截断, 原 N 字符)` 尾标,prompt 教模型遇截断要主动提醒用户。语言标识 `_MIME_TO_LANG` 优先 → `_EXT_TO_LANG` fallback。前端 `attachFiles(files)` + `renderAttachedFiles()` + `attachedFiles[]` 数组**与 `attachImages` 并行(不重命名)**,`dispatchSelectedFiles(fileList)` 按 `file.type` 分流到两个独立数组;📎 按钮 / `$fileInput.change` / `drop` 共用 `dispatchSelectedFiles`,`paste` 保持仅图片(文本粘贴走 textarea 即可)。`send()` body 同时携带 `images` 与 `attachments`,user 气泡同时展示图片缩略图条 + 文件 chip 条。`responses` 模式不支持,`attachments` 非空时 yield `error` SSE 帧。HITL pending **不单独存** attachments(附件已烘焙进 `messages`,随 `_PENDING["messages"]` 间接持久化到 runtime_state sidecar,与 images 对称;resume 后模型需看原始附件内容才能继续推理);Memory / markdown 归档**不存** attachments(D2/D4 安全防线,与 images 对称)。USER_PROMPT 增加附件处理指引(第 8 条)。non-goals:不做 PDF/二进制解析、不做附件持久化、不做 HITL resume 携带新附件。
@@ -289,7 +311,3 @@ All payloads are JSON. The HTTP layer's `_sse_stream` additionally injects AG-UI
 - **`enable_thinking` is going away**: docs flag this `extra_body` parameter as deprecated in favor of `reasoning.effort`. Both are still accepted today; we keep `enable_thinking` because the docs don't yet enumerate `reasoning.effort`'s legal values. Migrate when that's clarified —— 三组 LLM 实现(`_llm_*_responses` / `_llm_*_chat` / `_llm_*_chat_with_tools`)需要同步迁移。
 - **三组 LLM impls must stay in sync**: any change to the LLM streaming logic (chunk handling, error detection, logging fields, new `(kind, payload)` event types) must land in **all three pairs** of impls:`_llm_responses` / `_llm_stream_responses`、`_llm_chat` / `_llm_stream_chat`、`_llm_chat_with_tools` / `_llm_stream_chat_with_tools`。Otherwise the three `API_MODE` × tool 路径分支 diverge and bug repro depends on which mode the user happened to be in. The dispatchers `llm()` / `llm_stream()` 仍然只是一行 `if API_MODE == "chat"`,新增的 `llm_*_chat_with_tools` 入口**绕开**这两个分发器(签名不兼容)。注意 `_llm_chat_with_tools` 同步实现现在返回 **3-tuple `(content, tool_calls, reasoning_content)`** —— `reasoning_content` 用于 thinking 模式跨轮回传到下一轮 assistant 消息(参见下面"Chat 模式 ReAct 循环细节");异步实现 `_llm_stream_chat_with_tools` 的 `("thinking", text)` 增量事件由上层累计,无需新增协议。
 - Comments and prompts are in Chinese; preserve language when editing user-facing strings.
-
-## Skills present in the repo
-
-`.claude/skills/` and `.agents/skills/` contain installed skill bundles (`ata-all`, `ale-file-parser`). These are tooling for Claude Code itself, not part of the demo's runtime.
