@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Literal
 
@@ -65,6 +66,9 @@ from chat_core import (  # noqa: E402
     session_count,
     steer_response,
     stream_agent_response,
+    tracing_init,
+    tracing_public_config,
+    tracing_shutdown,
     ui_action_response,
 )
 
@@ -92,7 +96,17 @@ if not os.environ.get("DASHSCOPE_API_KEY_MCP"):
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI(title="Simple Chat Agent")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Langfuse:启动时建客户端并后台解析 project id(首个 trace_info 就能带上链接);
+    # 退出时 flush 队列里尚未发送的 observation。未配置 key 时两者都是 no-op。
+    tracing_init()
+    yield
+    tracing_shutdown()
+
+
+app = FastAPI(title="Simple Chat Agent", lifespan=_lifespan)
 
 
 # ============================================================
@@ -351,7 +365,11 @@ async def index() -> FileResponse:
 
 @app.get("/api/health")
 async def health() -> dict:
-    return {"ok": True, "model": MODEL, "api_mode": API_MODE, "sessions": session_count()}
+    return {
+        "ok": True, "model": MODEL, "api_mode": API_MODE, "sessions": session_count(),
+        # {enabled, base_url, project_id}:前端据此显示 Langfuse 会话链接(project_id 解析前为 null)
+        "langfuse": tracing_public_config(),
+    }
 
 
 @app.get("/api/runtime_state")

@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web-chat-agent",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "set -a; source .env; set +a; exec .venv/bin/python demo/web_chat_agent.py"
+      ],
+      "port": 8000
+    },
+    {
+      "name": "web-chat-agent-responses",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": [
+        "-c",
+        "set -a; source .env; set +a; export API_MODE=responses; exec .venv/bin/python demo/web_chat_agent.py"
+      ],
+      "port": 8000
+    }
+  ]
+}

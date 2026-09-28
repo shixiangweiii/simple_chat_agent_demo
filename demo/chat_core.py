@@ -10,6 +10,8 @@
     - archive_session / reset_session / delete_session / list_sessions / read_history / get_archive_path_if_exists / session_count
     - InvalidSessionId / HistoryNotFound  域异常,HTTP 层翻译为状态码
     - MODEL / API_MODE             从 llm_client 重新导出,便于上层只 import 本层
+    - tracing_init / tracing_shutdown / tracing_public_config
+                                   Langfuse 生命周期与前端配置(转出 tracing,入口层不直接 import 它)
 """
 
 import asyncio
@@ -20,7 +22,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator, Awaitable, Callable
+from typing import Any, AsyncGenerator, Awaitable, Callable
 
 # 沿用入口模块已设置的 sys.path,保证可以平级 import llm_client / mcp_web_search
 sys.path.insert(0, str(Path(__file__).parent))
@@ -34,6 +36,7 @@ from llm_client import (  # noqa: E402,F401
 )
 import mcp_web_search  # noqa: E402
 import longterm_memory  # noqa: E402  跨会话长期记忆(Phase 11),向下依赖,不反向 import chat_core
+import tracing  # noqa: E402  Langfuse 可观测性叶子模块(唯一 import langfuse 处;未配置时全 no-op)
 
 logger = logging.getLogger(__name__)
 
@@ -575,6 +578,8 @@ _SSE_PROTOCOL_TAGS: dict[str, dict[str, str]] = {
     "activity_delta":    {"ag_ui_type": "state_delta"},
     "done":              {"ag_ui_type": "run_finished"},
     "error":             {"ag_ui_type": "run_error"},
+    # Langfuse trace 首帧:AG-UI RUN_STARTED 语义(threadId=session_id, runId=trace_id)
+    "trace_info":        {"ag_ui_type": "run_started"},
     # 无标准映射的事件: thinking, search_status, component_loading,
     # render_component, component_error, confidence_signal, ui_hint, begin_rendering
 }
@@ -750,6 +755,9 @@ def _restore_runtime_state(session_id: str) -> None:
                     "data": data_obj if isinstance(data_obj, dict) else {},
                     "actions": surface.get("actions") if isinstance(surface.get("actions"), dict) else {},
                 }
+                if isinstance(surface.get("origin_trace_id"), str):
+                    # Langfuse:ui_action 新 trace 回链到渲染该 surface 的 trace
+                    safe_surface["origin_trace_id"] = surface["origin_trace_id"]
                 if not safe_surface["actions"]:
                     try:
                         safe_surface["actions"] = _extract_ui_actions(components)
@@ -1065,10 +1073,23 @@ def schedule_longterm_ingest(session_id: str) -> None:
         return
 
     async def _run():
-        try:
-            await longterm_memory.ingest_async(session_id, turns)
-        except Exception:
-            logger.warning("长期记忆后台摄入异常: %s", session_id, exc_info=True)
+        # 独立 trace(name=ltm-ingest),挂在被归档会话的 Langfuse session 下;抽取 / 协调 / 嵌入在内部埋点
+        tags = [f"api_mode:{API_MODE}", "route:ltm_ingest"]
+        with tracing.scope(session_id=session_id, trace_name="ltm-ingest", tags=tags,
+                           metadata={"api_mode": API_MODE, "model": MODEL}):
+            root = tracing.start_root(
+                "ltm-ingest", as_type="chain", input={"session_id": session_id, "turns": len(turns)},
+                trace_name="ltm-ingest", tags=tags,
+            )
+            try:
+                stats = await longterm_memory.ingest_async(session_id, turns, obs=root)
+                root.end(output=stats)  # None(NOOP / 失败)时保留 ingest 内部写的 output / level
+            except Exception as exc:
+                root.end(level="ERROR", status_message=f"{type(exc).__name__}: {exc}"[:1000])
+                logger.warning("长期记忆后台摄入异常: %s", session_id, exc_info=True)
+            except BaseException as exc:
+                _end_failed(root, exc)
+                raise
 
     try:
         task = asyncio.create_task(_run())
@@ -1574,6 +1595,11 @@ def confidence_decision(session_id: str, draft_id: str, decision: str) -> dict:
         memory = get_or_load(session_id)
         memory.add(Memory.USER, draft["user_input"])
         memory.add(Memory.AI, draft["answer"])
+    # 用户对低置信度草稿的事后反馈 → 原 trace 的布尔分(trace_id 由 _trace_confidence 记在草稿上)
+    tracing.score(
+        draft.get("trace_id"), "draft_accepted", 1.0 if decision == "accept" else 0.0,
+        data_type="BOOLEAN", comment=decision,
+    )
     return {"ok": True}
 
 
@@ -2117,11 +2143,248 @@ def _execute_immediate_local_tool(tool_name: str, args: dict, session_id: str) -
     return executor(args, session_id)
 
 
-def _react_chat_native(memory: Memory, user_input: str) -> str:
+# ============================================================
+# Langfuse 可观测性 —— 手动埋点的流级包装(设计见 docs/调研/Langfuse可观测性集成方案.md)
+# ============================================================
+# - 一条 SSE 流 = 一个 root observation(_traced_turn);HITL resume / plan 执行带着
+#   carrier(_PENDING["trace"] / plan["pending_state"]["trace"])续接回原 trace。
+# - _traced_turn 负责 root 开合与 trace_info 首帧,并从事件流派生 root 的 output / level /
+#   confidence 分 / steer 事件 —— 业务 generator 只需把 obs 往下传给 generation / tool 埋点。
+# - _traced_llm_stream 记 generation(完整 messages、reasoning、tool_calls、usage、TTFT),
+#   并吞掉 llm_client 的 ("usage", dict) 事件,消费循环因此不用识别这个 kind。
+# - 流被关闭有三种形态:is_disconnected() 后正常 return(没见到 done/error)、GeneratorExit
+#   (aclose)、CancelledError(任务取消)—— observation 都要收尾并标 WARNING。
+
+_STREAM_CLOSED = (GeneratorExit, asyncio.CancelledError)
+_CLOSED_MSG = "流被关闭(客户端断开)"
+
+
+def tracing_init() -> bool:
+    """入口启动时调用:建 Langfuse 客户端并后台解析 project id(入口层经此 re-export 接触 tracing)。"""
+    return tracing.init()
+
+
+def tracing_shutdown() -> None:
+    """入口退出时调用:flush 尚未发送的 observation。"""
+    tracing.shutdown()
+
+
+def tracing_public_config() -> dict:
+    """/api/health 用:{enabled, base_url, project_id},前端据此拼 Langfuse 会话链接。"""
+    return tracing.public_config()
+
+
+def _end_failed(obs: tracing.Obs, exc: BaseException) -> None:
+    """异常收尾:流被关闭记 WARNING,其余记 ERROR。调用方随后自行 re-raise。"""
+    if isinstance(exc, _STREAM_CLOSED):
+        obs.end(level="WARNING", status_message=_CLOSED_MSG)
+    else:
+        obs.end(level="ERROR", status_message=f"{type(exc).__name__}: {exc}"[:1000])
+
+
+def _clean_step_output(step: dict) -> dict:
+    """plan-step span 的 output:只留有值的状态字段。"""
+    return {k: step[k] for k in ("status", "result_summary", "error_message") if step.get(k)}
+
+
+def _remember_surface_trace(session_id: str, surface_id: str, obs: tracing.Obs) -> None:
+    """记下渲染该 surface 的 trace:/api/ui_action 开新 trace 时用 metadata.origin_trace_id 回链。"""
+    surface = (_UI_SURFACES.get(session_id) or {}).get(surface_id)
+    if surface is not None and obs.trace_id and surface.get("origin_trace_id") != obs.trace_id:
+        surface["origin_trace_id"] = obs.trace_id
+        _save_runtime_state(session_id)
+
+
+def _generation_output(content: str, reasoning: str, tool_calls: list[dict]) -> dict:
+    """generation 的 output 用 assistant 消息形态,Langfuse UI 按 ChatML 渲染。"""
+    out: dict = {"role": "assistant", "content": content or None}
+    if reasoning:
+        out["reasoning_content"] = reasoning
+    if tool_calls:
+        out["tool_calls"] = tool_calls
+    return out
+
+
+def _llm_generation(obs: tracing.Obs, name: str, input: Any, tools: list[dict] | None) -> tracing.Obs:
+    metadata: dict = {"api_mode": API_MODE}
+    if tools:
+        metadata["tools"] = [t.get("function", {}).get("name") for t in tools]
+    return obs.child(
+        name, as_type="generation", model=MODEL, input=input,
+        model_parameters={"enable_thinking": True, "stream": True}, metadata=metadata,
+    )
+
+
+def _trace_builtin_search(obs: tracing.Obs, current: tracing.Obs | None, phase: str) -> tracing.Obs | None:
+    """responses 模式内置 web_search 的 lifecycle → tool observation(看不到 query / 结果,只记时长)。"""
+    if current is None:
+        current = obs.child("web_search", as_type="tool", metadata={"builtin": True})
+    if phase == "completed":
+        current.end(output="completed")
+        return None
+    return current
+
+
+async def _traced_llm_stream(
+    obs: tracing.Obs,
+    name: str,
+    source: AsyncGenerator[tuple[str, Any], None],
+    *,
+    input: Any,
+    tools: list[dict] | None = None,
+) -> AsyncGenerator[tuple[str, Any], None]:
+    """给一次流式 LLM 调用记 generation;吞掉 ("usage", dict),其余事件原样转发。
+
+    input 在创建 generation 时即序列化(之后 messages 的 append 不影响已记录内容)。
+    """
+    gen = _llm_generation(obs, name, input, tools)
+    content: list[str] = []
+    reasoning: list[str] = []
+    tool_calls: list[dict] = []
+    usage = None
+    got_first = False
+    level = status = None
+    search: tracing.Obs | None = None
+    try:
+        async for kind, payload in source:
+            if kind == "usage":
+                usage = payload
+                continue
+            if not got_first and kind in ("thinking", "content", "tool_calls"):
+                got_first = True
+                gen.update(completion_start_time=tracing.now())
+            if kind == "content":
+                content.append(payload)
+            elif kind == "thinking":
+                reasoning.append(payload)
+            elif kind == "tool_calls":
+                tool_calls = payload
+            elif kind == "search_status":
+                search = _trace_builtin_search(obs, search, payload)
+            elif kind == "error":
+                level, status = "ERROR", str(payload)[:1000]
+            yield kind, payload
+    except _STREAM_CLOSED:
+        # 消费方收到 ("error", ...) 后会提前 return,本 generator 随后被 aclose —— 不能把 ERROR 降级成断连
+        if level is None:
+            level, status = "WARNING", _CLOSED_MSG
+        raise
+    except Exception as exc:
+        level, status = "ERROR", f"{type(exc).__name__}: {exc}"[:1000]
+        raise
+    finally:
+        if search is not None:
+            search.end(level=level, status_message=status)
+        gen.end(
+            output=_generation_output("".join(content), "".join(reasoning), tool_calls),
+            usage_details=tracing.usage_details(usage),
+            level=level,
+            status_message=status,
+        )
+
+
+def _trace_confidence(root: tracing.Obs, session_id: str, signal: dict) -> None:
+    """Phase 6 置信度 → trace 分数;低置信度草稿记下 trace_id,供 confidence_decision 事后打分。"""
+    score = signal.get("score")
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        root.score_trace(
+            "confidence", float(score), comment=signal.get("reason") or None,
+            metadata={"level": signal.get("level"), "draft": bool(signal.get("draft"))},
+        )
+    draft_id = signal.get("draft_id")
+    draft = (_ANSWER_DRAFTS.get(session_id) or {}).get(draft_id) if draft_id else None
+    if draft is not None and root.trace_id:
+        draft["trace_id"] = root.trace_id
+
+
+async def _traced_turn(
+    make_events: Callable[[tracing.Obs], AsyncGenerator[tuple[str, dict], None]],
+    *,
+    route: str,
+    name: str,
+    session_id: str,
+    input: Any = None,
+    as_type: str = "agent",
+    carrier: dict | None = None,
+    metadata: dict | None = None,
+) -> AsyncGenerator[tuple[str, dict], None]:
+    """给一条 SSE 流套上 root observation,并把 trace_info 作为首帧发给前端。
+
+    carrier 非空 = 续接原 trace:沿用原 trace_name / tags(实测不重新 propagate 的话,续接段
+    在 Langfuse 里会以自身 span 名命名、tags 为空),root 挂在原始 root 下。
+    追踪关闭时不发 trace_info,事件流与接入前完全一致。
+    """
+    carrier = carrier if isinstance(carrier, dict) else None
+    trace_name = (carrier or {}).get("trace_name") or route.replace("_", "-")
+    tags = list(dict.fromkeys([
+        *((carrier or {}).get("tags") or []), f"api_mode:{API_MODE}", f"route:{route}",
+    ]))
+    with tracing.scope(
+        session_id=session_id or None, trace_name=trace_name, tags=tags,
+        metadata={"api_mode": API_MODE, "model": MODEL},
+    ):
+        root = tracing.start_root(
+            name, as_type=as_type, input=input, metadata=metadata,
+            carrier=carrier, trace_name=trace_name, tags=tags,
+        )
+        if root:
+            yield ("trace_info", {
+                "trace_id": root.trace_id,
+                "trace_url": tracing.trace_url(root.trace_id),
+                "session_url": tracing.session_url(session_id) if session_id else None,
+                "continued": bool(carrier) and carrier.get("trace_id") == root.trace_id,
+                "route": route,
+                "sampled": root.sampled,
+            })
+        answer: list[str] = []
+        outcome: dict | None = None
+        terminated = False
+        level = status = None
+        try:
+            async for event in make_events(root):
+                ev_name, payload = event
+                if ev_name == "chunk":
+                    answer.append(payload.get("text") or "")
+                elif ev_name == "done":
+                    terminated = True
+                elif ev_name == "error":
+                    terminated = True
+                    level, status = "ERROR", str(payload.get("message") or "")[:1000]
+                elif ev_name == "await_user":
+                    outcome = {"status": "awaiting_user", **{
+                        k: payload[k] for k in ("kind", "name", "plan_id", "step_id") if payload.get(k)
+                    }}
+                elif ev_name == "confidence_signal":
+                    _trace_confidence(root, session_id, payload)
+                elif ev_name == "steer_applied":
+                    root.event("steer", input=payload)
+                yield event
+        except _STREAM_CLOSED:
+            if level is None:  # 已记录的 ERROR 优先于随后的断连
+                level, status = "WARNING", _CLOSED_MSG
+            raise
+        except Exception as exc:
+            level, status = "ERROR", f"{type(exc).__name__}: {exc}"[:1000]
+            raise
+        finally:
+            if level is None and not terminated:
+                level, status = "WARNING", "流未以 done/error 结束(客户端可能已断开)"
+            output = None
+            if not root.has_output:
+                text = "".join(answer).strip()
+                if outcome:
+                    output = {**outcome, "answer": text} if text else outcome
+                elif text:
+                    output = text
+            root.end(output=output, level=level, status_message=status)
+
+
+def _react_chat_native(memory: Memory, user_input: str, obs: tracing.Obs = tracing.NOOP) -> str:
     """[chat 模式 + native function calling] 同步 ReAct 循环,CLI 用。
 
     与 react() 等价契约:返回最终答复文本字符串(由 common_chat_agent.main 写回 Memory)。
     内部维护一个本地 messages 数组承载 tool_calls / tool_call_id 链接,循环结束就丢弃。
+    obs: 本轮 CLI trace 的 root(由 react() 创建),generation / tool 挂在它下面。
     """
     # Phase 11: CLI chat 模式被动注入长期记忆(同步全量),作为 system prompt 附加片段。
     messages = _memory_to_messages(memory, USER_PROMPT, user_input, longterm_memory.injection_fragment())
@@ -2137,7 +2400,19 @@ def _react_chat_native(memory: Memory, user_input: str) -> str:
             round_num, len(messages), [t["function"]["name"] for t in tools],
         )
 
-        content, tool_calls, reasoning_content = llm_chat_with_tools(messages, tools)
+        gen = _llm_generation(obs, f"llm-round-{round_num}", messages, tools)
+        usage: dict = {}
+        try:
+            content, tool_calls, reasoning_content = llm_chat_with_tools(
+                messages, tools, on_usage=usage.update,
+            )
+        except BaseException as exc:
+            gen.end(level="ERROR", status_message=f"{type(exc).__name__}: {exc}"[:1000])
+            raise
+        gen.end(
+            output=_generation_output(content, reasoning_content, tool_calls),
+            usage_details=tracing.usage_details(usage),
+        )
         logger.info(
             "第 %d 轮 llmResult(content=%d 字, tool_calls=%d 个, reasoning=%d 字)",
             round_num, len(content), len(tool_calls), len(reasoning_content),
@@ -2171,6 +2446,7 @@ def _react_chat_native(memory: Memory, user_input: str) -> str:
                 args = {}
             logger.info("执行工具调用:%s,开始", tc["name"])
             logger.info("工具参数:%s", args)
+            tool_obs = obs.child(tc["name"], as_type="tool", input=args, metadata={"tool_call_id": tc["id"]})
             if tc["name"] in LOCAL_TOOLS:
                 # HITL 工具在 CLI 模式下无法交互,直接喂回错误字符串让模型换路
                 tool_result = (
@@ -2188,6 +2464,8 @@ def _react_chat_native(memory: Memory, user_input: str) -> str:
                     tool_result = f"{tc['name']} 仅 Web 模式可见，请用文本继续说明。"
             else:
                 tool_result = mcp_web_search.call_tool_sync(tc["name"], args)
+            failed = tool_result.startswith(mcp_web_search.ERROR_PREFIX)
+            tool_obs.end(output=tool_result, level="ERROR" if failed else None)
             logger.info("执行工具调用:%s,结果=%s", tc["name"], tool_result)
             messages.append({
                 "role": "tool",
@@ -2209,12 +2487,15 @@ async def _stream_react_rounds(
     pending_remaining: list[dict],
     is_disconnected: Callable[[], Awaitable[bool]],
     tool_stats: dict | None = None,
+    obs: tracing.Obs = tracing.NOOP,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """ReAct 流式循环主体,支持两种入口:
        - fresh start: start_round=0, pending_remaining=[]
        - resume:      start_round=断点轮次, pending_remaining=断点未消费的剩余 tool_calls
 
     HITL 触发时把恢复点写入 _PENDING[session_id],yield ("await_user", ...) + ("done", {}) 关流。
+    obs: 当前流的 Langfuse root(chat-turn / hitl-resume),generation / tool 挂在它下面;
+    HITL / create_plan 中断时把 obs.carrier() 存进恢复点,续接流据此挂回同一条 trace。
     """
     tool_stats = tool_stats or _new_tool_stats()
     for round_num in range(start_round, MAX_ROUNDS):
@@ -2276,7 +2557,10 @@ async def _stream_react_rounds(
             answering_flipped = False
 
             try:
-                async for kind, payload in llm_stream_chat_with_tools(messages, tools):
+                async for kind, payload in _traced_llm_stream(
+                    obs, f"llm-round-{round_num}", llm_stream_chat_with_tools(messages, tools),
+                    input=messages, tools=tools,
+                ):
                     if await is_disconnected():
                         return
                     if kind == "thinking":
@@ -2384,12 +2668,16 @@ async def _stream_react_rounds(
                     "round_num": round_num,
                     "remaining_tool_calls": [],
                     "tool_call_id": tc["id"],
+                    # Langfuse 续接载体:plan_confirm / decision / continue 挂回本 trace(随 sidecar 持久化)
+                    "trace": obs.carrier(),
                 }
+                plan_obs = obs.child("create_plan", as_type="tool", input=args, metadata={"tool_call_id": tc["id"]})
                 try:
                     plan = _register_plan(session_id, args, pending_state)
                 except (InvalidSessionId, PlanValidationError) as exc:
                     tool_stats["tool_failures"] += 1
                     tool_result = f"create_plan 参数错误: {exc}"
+                    plan_obs.end(output=tool_result, level="ERROR", status_message=str(exc))
                     yield ("tool_result", {"name": tc["name"], "result": _truncate_tool_result(tool_result)})
                     messages.append({
                         "role": "tool",
@@ -2397,6 +2685,10 @@ async def _stream_react_rounds(
                         "content": tool_result,
                     })
                     continue
+                plan_obs.end(output={
+                    "plan_id": plan["plan_id"], "title": plan["title"],
+                    "steps": [s.get("title") for s in plan["steps"]], "status": plan["status"],
+                })
                 yield ("activity_snapshot", _plan_snapshot(plan, editable=True))
                 yield ("await_user", {
                     "tool_call_id": tc["id"],
@@ -2425,7 +2717,14 @@ async def _stream_react_rounds(
                         "args": args,
                         "kind": _LOCAL_TOOL_KIND[tc["name"]],
                     },
+                    # Langfuse 续接载体:/api/resume 挂回本 trace(随 sidecar 持久化,重启后仍可续接)
+                    "trace": obs.carrier(),
                 }
+                obs.event(
+                    "await_user",
+                    input={"tool": tc["name"], "args": args, "kind": _LOCAL_TOOL_KIND[tc["name"]]},
+                    metadata={"tool_call_id": tc["id"], "remaining_tool_calls": len(accumulated_tool_calls)},
+                )
                 _save_runtime_state(session_id)
                 logger.info(
                     "HITL 中断:session=%s tool=%s tool_call_id=%s remaining=%d 个",
@@ -2441,9 +2740,11 @@ async def _stream_react_rounds(
                 return
 
             if tc["name"] in IMMEDIATE_LOCAL_TOOLS:
+                tool_obs = obs.child(tc["name"], as_type="tool", input=args, metadata={"tool_call_id": tc["id"]})
                 result = _execute_immediate_local_tool(tc["name"], args, session_id)
                 if result.get("ok") and tc["name"] == "render_ui":
                     surface_id = result["surface_id"]
+                    _remember_surface_trace(session_id, surface_id, obs)
                     yield ("ui_surface_create", {"surface_id": surface_id})
                     # Phase 8a fix B1: mode 字段对齐双端合并语义。
                     # complete=true → replace(前端清空 Map 再装入); complete=false → merge(前端按 id 合并)。
@@ -2472,6 +2773,8 @@ async def _stream_react_rounds(
                 else:
                     tool_stats["tool_failures"] += 1
                     tool_result = result.get("error") or f"{tc['name']} 参数错误"
+                tool_ok = bool(result.get("ok")) and tc["name"] in ("render_ui", "update_ui_data")
+                tool_obs.end(output=tool_result, level=None if tool_ok else "ERROR")
                 logger.info("执行本地立即工具:%s,结果=%s", tc["name"], tool_result)
                 yield ("tool_result", {"name": tc["name"], "result": _truncate_tool_result(tool_result)})
                 messages.append({
@@ -2490,9 +2793,17 @@ async def _stream_react_rounds(
                     "placeholder_text": f"正在执行 {tc['name']}…",
                 })
 
-            tool_result = await mcp_web_search.call_tool_async(tc["name"], args)
-            if tool_result.startswith(mcp_web_search.ERROR_PREFIX):
+            tool_obs = obs.child(tc["name"], as_type="tool", input=args, metadata={"tool_call_id": tc["id"], "via": "mcp"})
+            try:
+                tool_result = await mcp_web_search.call_tool_async(tc["name"], args)
+            except BaseException as exc:
+                _end_failed(tool_obs, exc)
+                raise
+            failed = tool_result.startswith(mcp_web_search.ERROR_PREFIX)
+            if failed:
                 tool_stats["tool_failures"] += 1
+            # 完整结果进 Langfuse(SSE 的 tool_result 只给 TOOL_RESULT_PREVIEW_CHARS 预览)
+            tool_obs.end(output=tool_result, level="ERROR" if failed else None)
             logger.info("执行工具调用:%s,结果=%s", tc["name"], tool_result)
             yield ("tool_result", {"name": tc["name"], "result": _truncate_tool_result(tool_result)})
 
@@ -2528,6 +2839,7 @@ async def _stream_chat_native(
     adaptive_fragment: str = "",
     images: list[str] | None = None,
     attachments: list[dict] | None = None,
+    obs: tracing.Obs = tracing.NOOP,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """[chat 模式 + native function calling] 异步流式 ReAct 循环,Web 用。
 
@@ -2564,15 +2876,22 @@ async def _stream_chat_native(
         memory, USER_PROMPT, user_input, adaptive_fragment, images=images,
         attachments=attachments,
     )
+    # MCP schema 只在进程首个请求真正发现(之后走缓存),只给这一次记 span
+    discover = obs.child("mcp-discover-tools", as_type="span") if _NATIVE_TOOLS_CACHE is None else tracing.NOOP
     try:
         tools = await _build_native_tools_async()
     except Exception as exc:
         logger.exception("MCP schema 发现失败")
+        _end_failed(discover, exc)
         yield ("error", {"message": f"MCP schema 发现失败: {exc}"})
         return
+    except BaseException as exc:
+        _end_failed(discover, exc)
+        raise
+    discover.end(output=[t.get("function", {}).get("name") for t in tools])
 
     async for event in _stream_react_rounds(
-        session_id, memory, user_input, messages, tools, 0, [], is_disconnected,
+        session_id, memory, user_input, messages, tools, 0, [], is_disconnected, obs=obs,
     ):
         yield event
 
@@ -2617,8 +2936,12 @@ async def _stream_plan_step_rounds(
     start_round: int = 0,
     pending_remaining: list[dict] | None = None,
     append_step_input: bool = True,
+    obs: tracing.Obs = tracing.NOOP,
 ) -> AsyncGenerator[tuple[str, dict], None]:
-    """执行单个 plan step。结果写回 plan['steps'][step_index]['status']。"""
+    """执行单个 plan step。结果写回 plan['steps'][step_index]['status']。
+
+    obs: 该步骤的 Langfuse 父节点(plan-step-N span,resume 时为 hitl-resume root)。
+    """
     step = plan["steps"][step_index]
     if append_step_input and not pending_remaining:
         messages.append({"role": "user", "content": _build_plan_step_input(plan, step_index)})
@@ -2661,7 +2984,10 @@ async def _stream_plan_step_rounds(
             accumulated_tool_calls = []
             answering_flipped = False
             try:
-                async for kind, payload in llm_stream_chat_with_tools(messages, tools):
+                async for kind, payload in _traced_llm_stream(
+                    obs, f"llm-round-{round_num}", llm_stream_chat_with_tools(messages, tools),
+                    input=messages, tools=tools,
+                ):
                     if await is_disconnected():
                         return
                     if kind == "thinking":
@@ -2716,6 +3042,9 @@ async def _stream_plan_step_rounds(
 
             if tc["name"] == "create_plan":
                 tool_result = "计划执行中不支持嵌套 create_plan;请继续完成当前步骤。"
+                obs.child(tc["name"], as_type="tool", input=args, metadata={"tool_call_id": tc["id"]}).end(
+                    output=tool_result, level="WARNING", status_message="plan 内嵌套 create_plan 被拒",
+                )
                 yield ("tool_result", {"name": tc["name"], "result": _truncate_tool_result(tool_result)})
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_result})
                 continue
@@ -2738,7 +3067,14 @@ async def _stream_plan_step_rounds(
                         "plan_id": plan["plan_id"],
                         "step_index": step_index,
                     },
+                    # Langfuse 续接载体:锚点是本 trace 的原始 root(不是当前步骤 span),续接段平铺
+                    "trace": obs.carrier(),
                 }
+                obs.event(
+                    "await_user",
+                    input={"tool": tc["name"], "args": args, "kind": _LOCAL_TOOL_KIND[tc["name"]]},
+                    metadata={"tool_call_id": tc["id"], "plan_id": plan["plan_id"], "step_index": step_index},
+                )
                 _save_runtime_state(session_id)
                 yield ("await_user", {
                     "tool_call_id": tc["id"],
@@ -2750,9 +3086,11 @@ async def _stream_plan_step_rounds(
                 return
 
             if tc["name"] in IMMEDIATE_LOCAL_TOOLS:
+                tool_obs = obs.child(tc["name"], as_type="tool", input=args, metadata={"tool_call_id": tc["id"]})
                 result = _execute_immediate_local_tool(tc["name"], args, session_id)
                 if result.get("ok") and tc["name"] == "render_ui":
                     surface_id = result["surface_id"]
+                    _remember_surface_trace(session_id, surface_id, obs)
                     yield ("ui_surface_create", {"surface_id": surface_id})
                     # Phase 8a fix B1: mode 字段对齐双端合并语义。
                     yield ("ui_surface_update", {
@@ -2775,6 +3113,8 @@ async def _stream_plan_step_rounds(
                     tool_result = result.get("tool_result") or "UI 数据已更新"
                 else:
                     tool_result = result.get("error") or f"{tc['name']} 参数错误"
+                tool_ok = bool(result.get("ok")) and tc["name"] in ("render_ui", "update_ui_data")
+                tool_obs.end(output=tool_result, level=None if tool_ok else "ERROR")
                 yield ("tool_result", {"name": tc["name"], "result": _truncate_tool_result(tool_result)})
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_result})
                 continue
@@ -2786,7 +3126,14 @@ async def _stream_plan_step_rounds(
                     "tool_call_id": tc["id"],
                     "placeholder_text": f"正在执行 {tc['name']}…",
                 })
-            tool_result = await mcp_web_search.call_tool_async(tc["name"], args)
+            tool_obs = obs.child(tc["name"], as_type="tool", input=args, metadata={"tool_call_id": tc["id"], "via": "mcp"})
+            try:
+                tool_result = await mcp_web_search.call_tool_async(tc["name"], args)
+            except BaseException as exc:
+                _end_failed(tool_obs, exc)
+                raise
+            failed = tool_result.startswith(mcp_web_search.ERROR_PREFIX)
+            tool_obs.end(output=tool_result, level="ERROR" if failed else None)
             yield ("tool_result", {"name": tc["name"], "result": _truncate_tool_result(tool_result)})
             if component_type:
                 props = _build_component_props(tc["name"], args, tool_result)
@@ -2813,7 +3160,10 @@ async def _execute_plan_steps(
     plan: dict,
     is_disconnected: Callable[[], Awaitable[bool]],
     start_index: int | None = None,
+    obs: tracing.Obs = tracing.NOOP,
 ) -> AsyncGenerator[tuple[str, dict], None]:
+    """逐步执行计划。obs: 当前流的 Langfuse root(plan-confirm / plan-decision / plan-continue /
+    hitl-resume),每个步骤在它下面开一个 plan-step-N span。"""
     memory = get_or_load(session_id)
     messages = plan["execution_messages"]
     tools = plan["pending_state"]["tools"]
@@ -2830,10 +3180,25 @@ async def _execute_plan_steps(
         for event in _set_plan_step_status(plan, idx, "running", error_message=""):
             yield event
         _save_runtime_state(session_id)
-        async for event in _stream_plan_step_rounds(
-            session_id, plan, idx, messages, tools, is_disconnected,
-        ):
-            yield event
+        step_obs = obs.child(
+            f"plan-step-{idx + 1}", as_type="chain",
+            input={"step_id": step["id"], "title": step["title"]},
+            metadata={"plan_id": plan["plan_id"]},
+        )
+        try:
+            async for event in _stream_plan_step_rounds(
+                session_id, plan, idx, messages, tools, is_disconnected, obs=step_obs,
+            ):
+                yield event
+        except BaseException as exc:
+            _end_failed(step_obs, exc)
+            raise
+        step_failed = step["status"] == "error"
+        step_obs.end(
+            output=_clean_step_output(step),
+            level="ERROR" if step_failed else None,
+            status_message=step.get("error_message") if step_failed else None,
+        )
         if step["status"] == "waiting":
             _save_runtime_state(session_id)
             return
@@ -2865,6 +3230,8 @@ async def _execute_plan_steps(
     )
     memory.add(Memory.USER, plan["pending_state"]["user_input"])
     memory.add(Memory.AI, f"计划「{plan['title']}」已完成。\n{summary}")
+    # 显式 output 优先于 _traced_turn 的 chunk 拼接兜底
+    obs.update(output={"plan_id": plan["plan_id"], "status": "done", "summary": summary})
     session_plans = _PLANS.get(session_id)
     if isinstance(session_plans, dict):
         session_plans.pop(plan["plan_id"], None)
@@ -2897,16 +3264,29 @@ def plan_confirm_response(
     })
     plan["execution_messages"] = messages
     _save_runtime_state(session_id)
-    return _plan_confirm_inner(session_id, plan, is_disconnected)
+    return _traced_turn(
+        lambda obs: _plan_confirm_inner(session_id, plan, is_disconnected, obs),
+        route="plan_confirm", name="plan-confirm", session_id=session_id, as_type="chain",
+        carrier=_plan_trace_carrier(plan),
+        input={"plan_id": plan["plan_id"], "title": plan["title"],
+               "steps": [s.get("title") for s in plan["steps"]]},
+    )
+
+
+def _plan_trace_carrier(plan: dict) -> dict | None:
+    """create_plan 时存下的续接载体:三个 plan 流都挂回创建计划的那条 trace。"""
+    pending = plan.get("pending_state")
+    return pending.get("trace") if isinstance(pending, dict) else None
 
 
 async def _plan_confirm_inner(
     session_id: str,
     plan: dict,
     is_disconnected: Callable[[], Awaitable[bool]],
+    obs: tracing.Obs = tracing.NOOP,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     yield ("activity_snapshot", _plan_snapshot(plan, editable=False))
-    async for event in _execute_plan_steps(session_id, plan, is_disconnected, 0):
+    async for event in _execute_plan_steps(session_id, plan, is_disconnected, 0, obs=obs):
         yield event
 
 
@@ -2938,7 +3318,13 @@ def plan_decision_response(
         plan["steps"][idx]["error_message"] = None
     plan["status"] = "running"
     _save_runtime_state(session_id)
-    return _plan_decision_inner(session_id, plan, idx, decision, is_disconnected)
+    return _traced_turn(
+        lambda obs: _plan_decision_inner(session_id, plan, idx, decision, is_disconnected, obs),
+        route="plan_decision", name="plan-decision", session_id=session_id, as_type="chain",
+        carrier=_plan_trace_carrier(plan),
+        input={"plan_id": plan["plan_id"], "step_id": step_id, "decision": decision,
+               "steps": [s.get("title") for s in plan["steps"]]},
+    )
 
 
 async def _plan_decision_inner(
@@ -2947,6 +3333,7 @@ async def _plan_decision_inner(
     step_index: int,
     decision: str,
     is_disconnected: Callable[[], Awaitable[bool]],
+    obs: tracing.Obs = tracing.NOOP,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     yield ("activity_snapshot", _plan_snapshot(plan, editable=False))
     if decision == "skip":
@@ -2954,7 +3341,7 @@ async def _plan_decision_inner(
         start = step_index + 1
     else:
         start = step_index
-    async for event in _execute_plan_steps(session_id, plan, is_disconnected, start):
+    async for event in _execute_plan_steps(session_id, plan, is_disconnected, start, obs=obs):
         yield event
 
 
@@ -2984,7 +3371,12 @@ def plan_continue_response(
     current_idx = min(current_idx, max(len(plan.get("steps", [])) - 1, 0))
     plan["current_step_index"] = current_idx
     _save_runtime_state(session_id)
-    return _plan_continue_inner(session_id, plan, is_disconnected, current_idx)
+    return _traced_turn(
+        lambda obs: _plan_continue_inner(session_id, plan, is_disconnected, current_idx, obs),
+        route="plan_continue", name="plan-continue", session_id=session_id, as_type="chain",
+        carrier=_plan_trace_carrier(plan),
+        input={"plan_id": plan["plan_id"], "start_index": current_idx},
+    )
 
 
 async def _plan_continue_inner(
@@ -2992,9 +3384,10 @@ async def _plan_continue_inner(
     plan: dict,
     is_disconnected: Callable[[], Awaitable[bool]],
     start_index: int,
+    obs: tracing.Obs = tracing.NOOP,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     yield ("activity_snapshot", _plan_snapshot(plan, editable=False))
-    async for event in _execute_plan_steps(session_id, plan, is_disconnected, start_index):
+    async for event in _execute_plan_steps(session_id, plan, is_disconnected, start_index, obs=obs):
         yield event
 
 
@@ -3056,7 +3449,17 @@ def ui_action_response(
     lines.append("请基于这个用户交互继续完成任务;如需更新当前 UI,调用 update_ui_data。")
     user_event = "\n".join(lines)
     memory = get_or_load(session_id)
-    return stream_agent_response(memory, user_event, is_disconnected, session_id, None)
+    # 按钮点击是一次新的用户动作 → 新 trace;origin_trace_id 回链到渲染该 surface 的 trace
+    trace_metadata = {
+        k: v for k, v in {
+            "surface_id": surface_id, "component_id": component_id, "event_name": event_name,
+            "origin_trace_id": surface.get("origin_trace_id"),
+        }.items() if v
+    }
+    return stream_agent_response(
+        memory, user_event, is_disconnected, session_id, None,
+        route="ui_action", trace_metadata=trace_metadata,
+    )
 
 
 # ============================================================
@@ -3130,7 +3533,12 @@ def resume_chat_response(
         _save_runtime_state(session_id)
         raise PendingMismatch(tool_call_id)
     _save_runtime_state(session_id)
-    return _resume_inner(session_id, state, decision, answer, is_disconnected)
+    return _traced_turn(
+        lambda obs: _resume_inner(session_id, state, decision, answer, is_disconnected, obs),
+        route="hitl_resume", name=f"hitl-resume:{state['awaiting'].get('name')}",
+        session_id=session_id, carrier=state.get("trace"),
+        input={"tool": state["awaiting"].get("name"), "decision": decision, "answer": answer},
+    )
 
 
 async def _resume_inner(
@@ -3139,31 +3547,46 @@ async def _resume_inner(
     decision: str,
     answer: str | None,
     is_disconnected: Callable[[], Awaitable[bool]],
+    obs: tracing.Obs = tracing.NOOP,
 ) -> AsyncGenerator[tuple[str, dict], None]:
-    """resume 的真正流式体:构造 tool result → append role=tool → 继续 _stream_react_rounds。"""
+    """resume 的真正流式体:构造 tool result → append role=tool → 继续 _stream_react_rounds。
+
+    obs: 续接段 root(hitl-resume:<tool>,挂在原 trace 的原始 root 下)。
+    """
     memory = get_or_load(session_id)
     awaiting = state["awaiting"]
     name = awaiting["name"]
 
-    # 构造 tool result(模型看到的字符串)
-    if name == "ask_user":
-        tool_result = answer or "(用户未提供答复)"
-    elif name == "execute_shell_command":
-        if decision == "approve":
-            cmd = awaiting["args"].get("command", "")
-            if ALLOW_REAL_SHELL:
-                # 开关开启:真执行。失败/超时/黑名单都被 _execute_shell_real 转成字符串。
-                tool_result = await _execute_shell_real(cmd)
-            else:
-                # 默认安全态:不真执行,沿用原 demo stub。文案提示开关存在,避免被误判为 bug。
-                tool_result = (
-                    f"[demo stub] 已模拟执行命令: {cmd}\n"
-                    "(本 demo 默认不真执行 shell,导出 ALLOW_REAL_SHELL=1 后才会真执行)"
-                )
-        else:  # reject
-            tool_result = f"用户拒绝执行。理由: {answer or '(未填写)'}"
-    else:
-        tool_result = "(未知 HITL 工具)"
+    # HITL 工具本身在这里才真正"执行"(用户答复 / 审批后的 shell 执行),记成 tool observation
+    hitl_obs = obs.child(
+        name, as_type="tool",
+        input={"args": awaiting.get("args"), "decision": decision, "answer": answer},
+        metadata={"tool_call_id": awaiting.get("tool_call_id"), "hitl_kind": awaiting.get("kind")},
+    )
+    try:
+        # 构造 tool result(模型看到的字符串)
+        if name == "ask_user":
+            tool_result = answer or "(用户未提供答复)"
+        elif name == "execute_shell_command":
+            if decision == "approve":
+                cmd = awaiting["args"].get("command", "")
+                if ALLOW_REAL_SHELL:
+                    # 开关开启:真执行。失败/超时/黑名单都被 _execute_shell_real 转成字符串。
+                    tool_result = await _execute_shell_real(cmd)
+                else:
+                    # 默认安全态:不真执行,沿用原 demo stub。文案提示开关存在,避免被误判为 bug。
+                    tool_result = (
+                        f"[demo stub] 已模拟执行命令: {cmd}\n"
+                        "(本 demo 默认不真执行 shell,导出 ALLOW_REAL_SHELL=1 后才会真执行)"
+                    )
+            else:  # reject
+                tool_result = f"用户拒绝执行。理由: {answer or '(未填写)'}"
+        else:
+            tool_result = "(未知 HITL 工具)"
+    except BaseException as exc:
+        _end_failed(hitl_obs, exc)
+        raise
+    hitl_obs.end(output=tool_result, metadata={"real_shell": ALLOW_REAL_SHELL} if name == "execute_shell_command" else None)
 
     logger.info(
         "HITL resume:session=%s tool=%s decision=%s tool_result=%s",
@@ -3188,6 +3611,7 @@ async def _resume_inner(
             state["round_num"],
             state["remaining_tool_calls"],
             append_step_input=False,
+            obs=obs,
         ):
             yield event
         step = plan["steps"][step_index]
@@ -3197,7 +3621,7 @@ async def _resume_inner(
             ):
                 yield event
             _save_runtime_state(session_id)
-            async for event in _execute_plan_steps(session_id, plan, is_disconnected, step_index + 1):
+            async for event in _execute_plan_steps(session_id, plan, is_disconnected, step_index + 1, obs=obs):
                 yield event
         elif step["status"] == "error":
             for event in _set_plan_step_status(
@@ -3224,6 +3648,7 @@ async def _resume_inner(
         state["remaining_tool_calls"],
         is_disconnected,
         state.get("tool_stats"),
+        obs=obs,
     ):
         yield event
 
@@ -3232,15 +3657,49 @@ async def _resume_inner(
 # ReAct 主循环 - CLI 同步版
 # ============================================================
 
-def react(memory: Memory, latest_input: str) -> str:
+def react(
+    memory: Memory,
+    latest_input: str,
+    *,
+    session_id: str = "",
+    on_trace: Callable[[dict], None] | None = None,
+) -> str:
     """ReAct 核心循环:Thought -> Action -> Observation,受 MAX_ROUNDS 保护。CLI 用。
 
     API_MODE=chat 时走 native function calling 路径(_react_chat_native),
     联网搜索默认开启(MCP WebSearch),由模型自主判断是否调用。
-    """
-    if API_MODE == "chat":
-        return _react_chat_native(memory, latest_input)
 
+    可观测性:每次调用 = 一条 Langfuse trace(name=cli)。session_id 把同一 CLI 进程的多轮
+    归为一个 Langfuse 会话;on_trace 在本轮结束后收到 {trace_id, trace_url}(追踪关闭时不回调)。
+    """
+    tags = [f"api_mode:{API_MODE}", "route:cli"]
+    with tracing.scope(
+        session_id=session_id or None, trace_name="cli", tags=tags,
+        metadata={"api_mode": API_MODE, "model": MODEL},
+    ):
+        root = tracing.start_root("cli-turn", input={"message": latest_input}, trace_name="cli", tags=tags)
+        result: str | None = None
+        level = status = None
+        try:
+            if API_MODE == "chat":
+                result = _react_chat_native(memory, latest_input, obs=root)
+            else:
+                result = _react_responses(memory, latest_input, obs=root)
+            return result
+        except BaseException as exc:
+            level, status = "ERROR", f"{type(exc).__name__}: {exc}"[:1000]
+            raise
+        finally:
+            root.end(output=result, level=level, status_message=status)
+            if root and on_trace is not None:
+                try:
+                    on_trace({"trace_id": root.trace_id, "trace_url": tracing.trace_url(root.trace_id)})
+                except Exception:
+                    logger.debug("on_trace 回调失败", exc_info=True)
+
+
+def _react_responses(memory: Memory, latest_input: str, obs: tracing.Obs = tracing.NOOP) -> str:
+    """[responses 模式] CLI 同步 ReAct 循环:字符串 prompt + Action / Observation 文本协议。"""
     # Phase 11: CLI 被动注入长期记忆(同步全量,不接检索);算一次,各轮复用。
     ltm_fragment = longterm_memory.injection_fragment()
     for round_num in range(MAX_ROUNDS):
@@ -3249,7 +3708,14 @@ def react(memory: Memory, latest_input: str) -> str:
                     round_num, len(prompt), len(latest_input), len(memory.memories))
         logger.info("prompt=\n%s", prompt)
 
-        llm_result = llm(prompt)
+        gen = _llm_generation(obs, f"llm-round-{round_num}", prompt, None)
+        usage: dict = {}
+        try:
+            llm_result = llm(prompt, on_usage=usage.update)
+        except BaseException as exc:
+            gen.end(level="ERROR", status_message=f"{type(exc).__name__}: {exc}"[:1000])
+            raise
+        gen.end(output=_generation_output(llm_result, "", []), usage_details=tracing.usage_details(usage))
         logger.info("第 %d 轮 llmResult(%d 字)=\n%s", round_num, len(llm_result), llm_result)
 
         matched_tool_name = match_tool_action(llm_result)
@@ -3260,7 +3726,9 @@ def react(memory: Memory, latest_input: str) -> str:
         logger.info("执行工具调用:%s,开始", matched_tool_name)
         action_input = parse_action_input(llm_result)
         logger.info("工具参数:%s", action_input)
+        tool_obs = obs.child(matched_tool_name, as_type="tool", input=action_input, metadata={"protocol": "text"})
         tool_result = execute_tool(matched_tool_name, action_input)
+        tool_obs.end(output=tool_result)
         logger.info("执行工具调用:%s,结果=%s", matched_tool_name, tool_result)
 
         latest_input += f"\n{llm_result}\nObservation: {tool_result}"
@@ -3281,18 +3749,23 @@ async def stream_agent_response(
     context: dict | None = None,
     images: list[str] | None = None,
     attachments: list[dict] | None = None,
+    *,
+    route: str = "chat",
+    trace_metadata: dict | None = None,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """ReAct 流式循环,yield 抽象 (event_name, payload_dict) 元组,与 SSE/HTTP 层解耦。
 
     event_name 与 payload 字段直接对齐 SSE 事件契约:
+        - ("trace_info", {"trace_id", "trace_url", "session_url", "continued", "route", "sampled"})
+                                                  Langfuse trace 首帧(仅追踪启用时发,见 _traced_turn)
         - ("status", {"phase": "thinking"|"answering", "round": int})
         - ("thinking", {"text": str})            思考摘要增量
         - ("chunk", {"text": str})               答复增量(无 ReAct 工具时直接转发,有工具时缓冲到非工具回合再转发)
         - ("search_status", {"phase": str})      内置 web_search 阶段,仅 responses 模式
         - ("tool_call", {"name": str, "args": dict})
         - ("tool_result", {"name": str, "result": str})  result 已截断到 TOOL_RESULT_PREVIEW_CHARS
-        - ("await_user", {"tool_call_id":..., "name":..., "args":..., "kind": "input"|"approval"})
-                                                  HITL 工具触发,流即将关,等 /api/resume(仅 chat 模式)
+        - ("await_user", {"tool_call_id":..., "name":..., "args":..., "kind": "input"|"approval"|"plan"})
+                                                  HITL 工具触发,流即将关,等 /api/resume 或 /api/plan_confirm(仅 chat 模式)
         - ("ui_hint", {"mode": "focus"|"compact", "reason": str})
                                                   上下文感知推荐的 UI 模式(Phase 2)
         - ("ui_surface_create", {"surface_id": str})
@@ -3312,7 +3785,39 @@ async def stream_agent_response(
 
     API_MODE=chat 时走 native function calling 路径(_stream_chat_native),
     联网搜索默认开启(MCP WebSearch),通过 tool_call/tool_result 事件可见;不发 search_status。
+
+    route / trace_metadata: 仅用于 Langfuse(/api/chat 为 "chat";ui_action_response 复用本函数时
+    传 "ui_action" + surface/按钮信息)。每次调用都开一条新 trace。
     """
+    trace_input: dict = {"message": user_input}
+    if context:
+        trace_input["context"] = context
+    if images:
+        # 图片本体在 generation 的完整 messages 里,由 Langfuse SDK 识别 base64 并上传为 media
+        trace_input["images"] = len(images)
+    if attachments:
+        trace_input["attachments"] = [a.get("filename") for a in attachments]
+    async for event in _traced_turn(
+        lambda obs: _stream_agent_response_inner(
+            memory, user_input, is_disconnected, session_id, context, images, attachments, obs,
+        ),
+        route=route, name="ui-action" if route == "ui_action" else "chat-turn",
+        session_id=session_id, input=trace_input, metadata=trace_metadata,
+    ):
+        yield event
+
+
+async def _stream_agent_response_inner(
+    memory: Memory,
+    user_input: str,
+    is_disconnected: Callable[[], Awaitable[bool]],
+    session_id: str,
+    context: dict | None,
+    images: list[str] | None,
+    attachments: list[dict] | None,
+    obs: tracing.Obs,
+) -> AsyncGenerator[tuple[str, dict], None]:
+    """stream_agent_response 的业务体;obs 是本流的 Langfuse root(chat-turn / ui-action)。"""
     adaptive_fragment, ui_mode, ui_reason = _compute_adaptive_prompt(context, memory)
     if ui_mode != "chat":
         yield ("ui_hint", {"mode": ui_mode, "reason": ui_reason})
@@ -3328,13 +3833,19 @@ async def stream_agent_response(
     # 放在首帧(snapshot/ui_hint)之后,让前端先收到首帧,不被 embed+rerank 网络往返阻塞;
     # 已断连则跳过检索(省 embed/rerank 调用),下游 _stream_* 仍会再次探测断连并退出。
     if not await is_disconnected():
-        ltm_fragment = await longterm_memory.retrieve_injection_async(user_input)
+        retrieval = obs.child("ltm-retrieve", as_type="retriever", input={"query": user_input})
+        try:
+            ltm_fragment = await longterm_memory.retrieve_injection_async(user_input, obs=retrieval)
+        except BaseException as exc:  # 检索本身绝不抛;这里只可能是流被关闭
+            _end_failed(retrieval, exc)
+            raise
+        retrieval.end(output=ltm_fragment or None)
         adaptive_fragment = "\n\n".join(s for s in (ltm_fragment, adaptive_fragment) if s)
 
     if API_MODE == "chat":
         async for event in _stream_chat_native(
             memory, user_input, is_disconnected, session_id, adaptive_fragment,
-            images=images, attachments=attachments,
+            images=images, attachments=attachments, obs=obs,
         ):
             yield event
         return
@@ -3372,7 +3883,9 @@ async def stream_agent_response(
         answering_flipped = False
 
         try:
-            async for kind, text in llm_stream(prompt):
+            async for kind, text in _traced_llm_stream(
+                obs, f"llm-round-{round_num}", llm_stream(prompt), input=prompt,
+            ):
                 if await is_disconnected():
                     return
                 if kind == "thinking":
@@ -3418,7 +3931,9 @@ async def stream_agent_response(
             logger.info("工具参数:%s", args)
             tool_stats["tool_calls"] += 1
             yield ("tool_call", {"name": matched, "args": args})
+            tool_obs = obs.child(matched, as_type="tool", input=args, metadata={"protocol": "text"})
             tool_result = execute_tool(matched, args)
+            tool_obs.end(output=tool_result)
             logger.info("执行工具调用:%s,结果=%s", matched, tool_result)
             yield ("tool_result", {"name": matched, "result": _truncate_tool_result(tool_result)})
             latest_input += f"\n{full}\nObservation: {tool_result}"

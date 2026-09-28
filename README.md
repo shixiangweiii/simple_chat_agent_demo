@@ -28,7 +28,12 @@ export DASHSCOPE_API_KEY_MCP=sk-xxx    # 可选，MCP 联网搜索用；缺失�
 export QWEN_MODEL=qwen3.7-max          # 可选，默认 qwen3.7-max
 export API_MODE=responses              # 可选，responses(默认) 或 chat
 export ALLOW_REAL_SHELL=0              # 可选，默认 0(不真执行 shell)
+export LANGFUSE_PUBLIC_KEY=pk-lf-xxx   # 可选，与下两项一起配置后启用 Langfuse 追踪
+export LANGFUSE_SECRET_KEY=sk-lf-xxx
+export LANGFUSE_BASE_URL=http://localhost:3000   # 可选，自托管地址；默认 https://cloud.langfuse.com
 ```
+
+> Langfuse 可观测性（Python SDK v4 手动埋点）：配置上面三个 `LANGFUSE_*` 变量后，每次对话记一条 trace（generation 含完整 messages / 思考内容 / token 用量，工具调用含完整结果，图片上传为 media），HITL 恢复与计划执行续接到同一条 trace。Web 页面每条 AI 回复底部显示 trace id 与「↗ Langfuse」链接，页头 🔭 打开当前会话；CLI 在 stderr 打印 trace 链接。未配置时对原有行为零影响。细节见 [CLAUDE.md](./CLAUDE.md)「Langfuse 可观测性」。
 
 > `DASHSCOPE_API_KEY_MCP` 仅在 `API_MODE=chat` 下生效（MCP 联网搜索路径需要鉴权）。
 > 如果未设置，MCP 调用将 fallback 使用 `DASHSCOPE_API_KEY`。设置独立 key 的好处:

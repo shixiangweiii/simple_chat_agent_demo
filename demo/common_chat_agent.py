@@ -3,15 +3,19 @@
 启动:
     export DASHSCOPE_API_KEY=sk-xxx
     python demo/common_chat_agent.py
+
+配置了 LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY 时,每轮对话一条 Langfuse trace,
+同一进程的多轮归为一个 Langfuse 会话;trace 链接打印到 stderr。
 """
 
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from chat_core import Memory, react  # noqa: E402
+from chat_core import Memory, react, tracing_init, tracing_shutdown  # noqa: E402
 
 
 def main():
@@ -38,23 +42,32 @@ def main():
         )
 
     memory = Memory()
+    # Langfuse:提前初始化(后台解析 project id,首轮就能打印链接);本进程的多轮归为一个会话
+    tracing_init()
+    cli_session_id = f"cli-{uuid.uuid4()}"
     print("通用聊天 Agent 已启动，请开始对话（输入 exit 退出）", file=sys.stderr)
 
-    while True:
-        try:
-            user_input = input()
-        except EOFError:
-            break
+    try:
+        while True:
+            try:
+                user_input = input()
+            except EOFError:
+                break
 
-        if user_input.strip().lower() == "exit":
-            print("检测到退出指令，对话结束！")
-            break
+            if user_input.strip().lower() == "exit":
+                print("检测到退出指令，对话结束！")
+                break
 
-        output = react(memory, user_input)
-        print(f"AI: {output}", file=sys.stderr)
+            trace: dict = {}
+            output = react(memory, user_input, session_id=cli_session_id, on_trace=trace.update)
+            print(f"AI: {output}", file=sys.stderr)
+            if trace:  # 追踪关闭时 react 不回调
+                print(f"[trace] {trace.get('trace_url') or trace.get('trace_id')}", file=sys.stderr)
 
-        memory.add(Memory.USER, user_input)
-        memory.add(Memory.AI, output)
+            memory.add(Memory.USER, user_input)
+            memory.add(Memory.AI, output)
+    finally:
+        tracing_shutdown()  # flush 尚未发送的 observation(SDK 的 atexit 之外的显式兜底)
 
 
 if __name__ == "__main__":

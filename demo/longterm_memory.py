@@ -4,8 +4,12 @@
 从每个会话归档时批量抽取"关于用户的原子事实",经 LLM 协调(ADD/UPDATE/DELETE)并入全局
 记忆库,在后续任意会话的 system prompt 里注入,让 Agent 跨会话"记得用户"。
 
-分层:本模块在 chat_core **下层**,只依赖 llm_client(向下),**禁止** import chat_core(避免环)。
-只吃原语(turns: list[{role,msg}] / query: str),不依赖 Memory 类。
+分层:本模块在 chat_core **下层**,只依赖 llm_client 与无依赖叶子模块 tracing(向下),
+**禁止** import chat_core(避免环)。只吃原语(turns: list[{role,msg}] / query: str),不依赖 Memory 类。
+
+可观测性:ingest_async / retrieve_injection_async 接收可选 obs(tracing.Obs,默认 NOOP),
+抽取 / 协调记 generation、嵌入记 embedding、rerank 记 span;检索把走了降级阶梯的哪一级
+写进 obs.metadata.path。obs 由 chat_core 创建(ltm-ingest trace / ltm-retrieve retriever)。
 
 存储(均 git-ignored,与 chat_archive / runtime_state 同级):
     - data/longterm_memory.json   人类可读的事实库 + 摄入水位线
@@ -31,10 +35,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 from llm_client import (  # noqa: E402
     EMBED_DIM,
     EMBED_MODEL,
+    LTM_MODEL,
+    RERANK_MODEL,
     complete_async,
     embed_texts_async,
     rerank_async,
 )
+import tracing  # noqa: E402  可观测性叶子模块(不 import 任何项目模块,不构成环)
 
 logger = logging.getLogger(__name__)
 
@@ -278,12 +285,28 @@ def _parse_json_array(text: str, *, strict: bool = False) -> list:
 # 抽取 + 协调 + 应用
 # ============================================================
 
-async def extract_facts_async(turns: list[dict]) -> list[dict]:
+async def _traced_complete(obs: tracing.Obs, name: str, prompt: str) -> str:
+    """无工具补全 + generation 埋点(完整 prompt、原始输出、usage)。"""
+    gen = obs.child(
+        name, as_type="generation", model=LTM_MODEL, input=prompt,
+        model_parameters={"temperature": 0.0, "stream": False},
+    )
+    usage: dict = {}
+    try:
+        raw = await complete_async(prompt, on_usage=usage.update)
+    except BaseException as exc:
+        gen.end(level="ERROR", status_message=f"{type(exc).__name__}: {exc}"[:1000])
+        raise
+    gen.end(output=raw, usage_details=tracing.usage_details(usage))
+    return raw
+
+
+async def extract_facts_async(turns: list[dict], obs: tracing.Obs = tracing.NOOP) -> list[dict]:
     """从对话抽取候选原子事实 [{text, category}]。真·空返回 [];坏 JSON 抛 _LTMParseError(上层不推进水位线)。"""
     rendered = _render_turns(turns)
     if not rendered.strip():
         return []
-    raw = await complete_async(_EXTRACT_PROMPT.format(dialogue=rendered))
+    raw = await _traced_complete(obs, "ltm-extract", _EXTRACT_PROMPT.format(dialogue=rendered))
     out: list[dict] = []
     for it in _parse_json_array(raw, strict=True):
         if isinstance(it, dict):
@@ -297,11 +320,13 @@ async def extract_facts_async(turns: list[dict]) -> list[dict]:
     return out
 
 
-async def reconcile_async(existing: list[dict], candidates: list[dict]) -> list[dict]:
+async def reconcile_async(
+    existing: list[dict], candidates: list[dict], obs: tracing.Obs = tracing.NOOP,
+) -> list[dict]:
     """LLM 协调:候选 vs 已有 → 操作列表。校验 UPDATE/DELETE 的 id 真实存在,丢弃幻觉 id。"""
     if not candidates:
         return []
-    raw = await complete_async(_RECONCILE_PROMPT.format(
+    raw = await _traced_complete(obs, "ltm-reconcile", _RECONCILE_PROMPT.format(
         existing=_render_existing(existing), candidates=_render_candidates(candidates),
     ))
     valid_ids = {f.get("id") for f in existing}
@@ -388,8 +413,11 @@ def apply_ops(data: dict, ops: list[dict], sid: str) -> tuple[dict, set, set]:
 # 向量同步(Milestone B)
 # ============================================================
 
-async def _sync_vectors(data: dict, to_embed_ids: set, deleted_ids: set) -> None:
+async def _sync_vectors(
+    data: dict, to_embed_ids: set, deleted_ids: set, obs: tracing.Obs = tracing.NOOP,
+) -> None:
     """同步向量库:嵌入新增/改动事实,删掉已删事实。best-effort —— 失败只 log,不影响事实保存。"""
+    emb = tracing.NOOP
     try:
         vdata = _load_vectors_disk()  # 写路径:读盘新对象,不动读缓存
         if vdata.get("embed_model") != EMBED_MODEL or vdata.get("dim") != EMBED_DIM:
@@ -402,11 +430,18 @@ async def _sync_vectors(data: dict, to_embed_ids: set, deleted_ids: set) -> None
             vectors.pop(fid, None)
         targets = [f for f in data["facts"] if f["id"] in to_embed_ids]
         if targets:
-            vecs = await embed_texts_async([f["text"] for f in targets])
+            texts = [f["text"] for f in targets]
+            emb = obs.child("ltm-embed-facts", as_type="embedding", model=EMBED_MODEL, input=texts,
+                            metadata={"dim": EMBED_DIM})
+            usage: dict = {}
+            vecs = await embed_texts_async(texts, on_usage=usage.update)
+            emb.end(output={"count": len(vecs), "dim": EMBED_DIM}, usage_details=tracing.usage_details(usage))
             for f, v in zip(targets, vecs):
                 vectors[f["id"]] = v
         _save_vectors(vdata)
-    except Exception:
+    except Exception as exc:
+        emb.end(level="ERROR", status_message=f"{type(exc).__name__}: {exc}"[:1000])
+        obs.update(level="WARNING", status_message="向量同步失败(事实已保存,检索将走降级)")
         logger.warning("LTM 向量同步失败(事实已保存,检索将走降级)", exc_info=True)
 
 
@@ -414,12 +449,12 @@ async def _sync_vectors(data: dict, to_embed_ids: set, deleted_ids: set) -> None
 # 摄入编排(归档时后台调用)
 # ============================================================
 
-async def ingest_async(sid: str, turns: list[dict]) -> dict | None:
+async def ingest_async(sid: str, turns: list[dict], obs: tracing.Obs = tracing.NOOP) -> dict | None:
     """从一个会话的 turns 增量摄入长期记忆。返回 stats 或 None(NOOP/失败)。
 
     增量水位线去重:只处理"自上次摄入以来"的新增 turns;无足够新增直接 NOOP。
     全程持 _LTM_LOCK 串行(含 LLM/embedding 调用,单用户 demo 可接受);失败不推进水位线,
-    下次归档可重试。
+    下次归档可重试。obs: ltm-ingest trace 的 root(NOOP / 失败原因写在它上面)。
     """
     async with _LTM_LOCK:
         data = _load_disk()  # 写路径:读盘新对象去 mutate,不动读缓存
@@ -427,18 +462,21 @@ async def ingest_async(sid: str, turns: list[dict]) -> dict | None:
         new_turns = turns[watermark:]
         if len(new_turns) < MIN_TURNS_TO_INGEST:
             logger.info("LTM ingest NOOP:sid=%s new_turns=%d(< %d)", sid, len(new_turns), MIN_TURNS_TO_INGEST)
+            obs.update(output={"noop": True, "new_turns": len(new_turns), "min_turns": MIN_TURNS_TO_INGEST})
             return None
+        obs.update(metadata={"watermark": watermark, "new_turns": len(new_turns)})
         try:
-            candidates = await extract_facts_async(new_turns)
+            candidates = await extract_facts_async(new_turns, obs=obs)
             if not candidates:
                 # 没抽到事实也推进水位线,避免下次重复抽同一段
                 data["ingested"][sid] = len(turns)
                 _save(data)
                 logger.info("LTM ingest:sid=%s 抽取 0 条候选,推进水位线", sid)
                 return {"added": 0, "updated": 0, "deleted": 0}
-            ops = await reconcile_async(data["facts"], candidates)
+            ops = await reconcile_async(data["facts"], candidates, obs=obs)
             stats, to_embed, deleted = apply_ops(data, ops, sid)
-            await _sync_vectors(data, to_embed, deleted)
+            obs.event("ltm-apply", input={"candidates": candidates, "ops": ops}, output=stats)
+            await _sync_vectors(data, to_embed, deleted, obs=obs)
             data["ingested"][sid] = len(turns)
             _save(data)
             logger.info(
@@ -446,8 +484,11 @@ async def ingest_async(sid: str, turns: list[dict]) -> dict | None:
                 sid, len(candidates), len(ops), stats, len(data["facts"]),
             )
             return stats
-        except Exception:
+        except Exception as exc:
             logger.warning("LTM ingest 失败(不推进水位线,下次重试):sid=%s", sid, exc_info=True)
+            obs.update(level="ERROR", status_message=(
+                f"摄入失败(不推进水位线,下次归档重试): {type(exc).__name__}: {exc}"
+            )[:1000])
             return None
 
 
@@ -492,8 +533,11 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
-async def _retrieve(query: str, facts: list[dict]) -> list[dict]:
-    """召回(cosine)→ 精排(rerank),带降级。要求 facts 数 > INJECT_ALL_MAX 才进来。"""
+async def _retrieve(query: str, facts: list[dict], obs: tracing.Obs = tracing.NOOP) -> list[dict]:
+    """召回(cosine)→ 精排(rerank),带降级。要求 facts 数 > INJECT_ALL_MAX 才进来。
+
+    obs.metadata.path 记录走到降级阶梯的哪一级:rerank / cosine_fallback / recent:no_vectors / recent:no_scored。
+    """
     vdata = _load_vectors()
     vectors = vdata.get("vectors") if isinstance(vdata, dict) else None
     header_ok = (
@@ -502,33 +546,66 @@ async def _retrieve(query: str, facts: list[dict]) -> list[dict]:
         and vdata.get("dim") == EMBED_DIM
     )
     if not header_ok or not vectors:
+        obs.update(metadata={"path": "recent:no_vectors"})
         return _recent_facts(facts, RERANK_TOP_K)  # 无可用向量 → 最近 K
 
-    qvec = (await embed_texts_async([query]))[0]
+    emb = obs.child("ltm-query-embed", as_type="embedding", model=EMBED_MODEL, input=query,
+                    metadata={"dim": EMBED_DIM})
+    usage: dict = {}
+    try:
+        qvec = (await embed_texts_async([query], on_usage=usage.update))[0]
+    except BaseException as exc:
+        emb.end(level="ERROR", status_message=f"{type(exc).__name__}: {exc}"[:1000])
+        raise
+    emb.end(output={"dim": len(qvec)}, usage_details=tracing.usage_details(usage))
     scored = [(_cosine(qvec, v), f) for f in facts if (v := vectors.get(f["id"]))]
     if not scored:
+        obs.update(metadata={"path": "recent:no_scored"})
         return _recent_facts(facts, RERANK_TOP_K)
     scored.sort(key=lambda x: x[0], reverse=True)
     recalled = [f for _, f in scored[:RECALL_TOP_N]]
 
-    rr = await rerank_async(query, [f["text"] for f in recalled], RERANK_TOP_K)
+    rr_obs = obs.child(
+        "ltm-rerank", as_type="span",
+        input={"query": query, "documents": [f["text"] for f in recalled], "top_n": RERANK_TOP_K},
+        metadata={"model": RERANK_MODEL, "recalled": len(recalled)},
+    )
+    try:
+        rr = await rerank_async(query, [f["text"] for f in recalled], RERANK_TOP_K)
+    except BaseException as exc:
+        rr_obs.end(level="ERROR", status_message=f"{type(exc).__name__}: {exc}"[:1000])
+        raise
     if rr is None:  # rerank 失败 → 用 cosine 序前 K
+        rr_obs.end(level="WARNING", status_message="rerank 失败,降级为 cosine 序")
+        obs.update(metadata={"path": "cosine_fallback"})
         return recalled[:RERANK_TOP_K]
+    rr_obs.end(output=[
+        {"index": idx, "score": score, "text": recalled[idx]["text"]} for idx, score in rr[:RERANK_TOP_K]
+    ])
+    obs.update(metadata={"path": "rerank"})
     return [recalled[idx] for idx, _ in rr[:RERANK_TOP_K]]
 
 
-async def retrieve_injection_async(query: str) -> str:
-    """注入主入口(Web)。事实少→全量;多→召回+精排;任何失败→降级,绝不抛。"""
+async def retrieve_injection_async(query: str, obs: tracing.Obs = tracing.NOOP) -> str:
+    """注入主入口(Web)。事实少→全量;多→召回+精排;任何失败→降级,绝不抛。
+
+    obs: chat_core 建的 ltm-retrieve retriever;降级路径写进 metadata.path(empty / inject_all / ...)。
+    """
     facts = _load().get("facts", [])
     if not facts:
+        obs.update(metadata={"path": "empty", "facts_total": 0})
         return ""
     if len(facts) <= INJECT_ALL_MAX:
+        obs.update(metadata={"path": "inject_all", "facts_total": len(facts)})
         return _format_facts(facts)
     try:
-        selected = await _retrieve(query, facts)
-    except Exception:
+        selected = await _retrieve(query, facts, obs=obs)
+    except Exception as exc:
         logger.warning("LTM 检索失败,降级为最近事实", exc_info=True)
+        obs.update(level="WARNING", status_message=f"检索失败,降级为最近事实: {type(exc).__name__}",
+                   metadata={"path": "recent:error"})
         selected = _recent_facts(facts, RERANK_TOP_K)
+    obs.update(metadata={"facts_total": len(facts), "selected": len(selected)})
     return _format_facts(selected)
 
 

@@ -1,7 +1,7 @@
 # SSE 事件契约
 
 > 本文档定义 `simple_chat_agent_demo` 的 SSE (Server-Sent Events) 事件契约。
-> 版本: Phase 10a (2026-06-08)
+> 版本: Phase 10a (2026-06-08);Langfuse `trace_info` (2026-09-28)
 
 ## 传输格式
 
@@ -23,6 +23,24 @@ event: {event_name}\ndata: {json_payload}\n\n
 ---
 
 ## 事件列表
+
+### `"trace_info"` — Langfuse trace 首帧
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `trace_id` | `str` | 32 位十六进制 Langfuse trace id |
+| `trace_url` | `str \| null` | Langfuse UI 中该 trace 的链接;服务端尚未解析出 project id 时为 `null` |
+| `session_url` | `str \| null` | 该会话在 Langfuse 的 session 页链接(同上可能为 `null`) |
+| `continued` | `bool` | `true` = 本流是同一条 trace 的续接段(`/api/resume`、`/api/plan_*`) |
+| `route` | `str` | `chat` / `ui_action` / `hitl_resume` / `plan_confirm` / `plan_decision` / `plan_continue` |
+| `sampled` | `bool` | `false` 表示被 `LANGFUSE_SAMPLE_RATE` 采样掉,Langfuse 中查不到 |
+| `ag_ui_type` | `"run_started"` | AG-UI 对标(threadId=session_id,runId=trace_id) |
+
+**仅在追踪启用时发**(配置了 `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`),且总是流的**第一帧**,早于 `ui_hint` / `agent_state_snapshot` / `activity_snapshot`,保证早期报错也能拿到 id。6 条 SSE 流都会发;追踪关闭时不发,事件序列与未接入时完全一致。前端在 AI 气泡底部渲染 trace chip(短 id、复制、↗ Langfuse、`续接` / `未采样` 标记)。设计见 `docs/调研/Langfuse可观测性集成方案.md`。
+
+引入: Langfuse 集成
+
+---
 
 ### `"status"` — 轮次边界
 
@@ -479,6 +497,7 @@ patch 路径: `/steps/{i}/status`, `/steps/{i}/result_summary`, `/steps/{i}/erro
 
 | 本项目事件 | AG-UI 对标 | A2UI 对标 |
 |---|---|---|
+| `trace_info` | `RUN_STARTED`(threadId=session_id,runId=trace_id) | — |
 | `status` | `STEP_STARTED` / `STEP_FINISHED` | — |
 | `thinking` | — | — |
 | `chunk` | `TEXT_MESSAGE_CONTENT` | — |

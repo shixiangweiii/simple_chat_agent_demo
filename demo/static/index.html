@@ -527,6 +527,41 @@
     font-size: 12.5px;
   }
   .confidence-panel[hidden] { display: none; }
+  /* Langfuse trace chip:AI 气泡底部,trace_info 首帧到达即显示,方便从页面直接定位排查 */
+  .trace-meta {
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    font-size: 11.5px;
+    color: var(--text-muted);
+  }
+  .trace-meta[hidden] { display: none; }
+  .trace-meta code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: var(--text);
+    cursor: help;
+  }
+  .trace-meta button, .trace-meta a {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 0 6px;
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--primary);
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .trace-meta button:hover, .trace-meta a:hover { background: var(--hover); }
+  .trace-badge { border-radius: 999px; padding: 0 7px; background: var(--selected); color: var(--primary); }
+  .trace-badge.warn { background: var(--status-bg); color: #b45309; }
+  a.icon-btn { text-decoration: none; color: inherit; }
+  a.icon-btn[hidden] { display: none; }
   .confidence-row {
     display: flex;
     align-items: center;
@@ -1264,6 +1299,7 @@
           <code class="sid-display" id="sid-display" title="">--------</code>
           <button class="icon-btn" id="copy-sid" title="复制完整 session_id">📋</button>
           <button class="icon-btn" id="preview-archive" title="预览本会话的归档 markdown 文件">📄</button>
+          <a class="icon-btn" id="langfuse-session" target="_blank" rel="noopener" hidden title="在 Langfuse 查看本会话的全部 trace">🔭</a>
         </div>
       </div>
       <div class="header-actions">
@@ -1361,6 +1397,7 @@
   const $archive = document.getElementById('archive');
   const $newSession = document.getElementById('new-session');
   const $copySid = document.getElementById('copy-sid');
+  const $langfuseSession = document.getElementById('langfuse-session');
   const $sidDisplay = document.getElementById('sid-display');
   const $sessionList = document.getElementById('session-list');
   const $toastContainer = document.getElementById('toast-container');
@@ -2100,6 +2137,7 @@
   // - responses 模式或 API_MODE_CACHE != 'chat' 时不进入 steer 模式 (按钮保持 "生成中...")
   let streamSteerActive = false;
   let API_MODE_CACHE = 'chat';  // Phase 9a + Step 10: 由 init() fetchHealth() 填充
+  let LANGFUSE_CFG = null;      // /api/health.langfuse: {enabled, base_url, project_id};追踪关闭时 enabled=false
   const DEFAULT_INPUT_PLACEHOLDER = '输入消息（Shift+Enter 换行）';
   const STEER_INPUT_PLACEHOLDER = '流活跃中 — 输入纠偏指令（回车发送），或等流结束';
 
@@ -2261,10 +2299,80 @@
     if (!SESSION_ID) {
       $sidDisplay.textContent = '--------';
       $sidDisplay.title = '';
+      updateLangfuseSessionLink();
       return;
     }
     $sidDisplay.textContent = SESSION_ID.slice(0, 8);
     $sidDisplay.title = SESSION_ID;
+    updateLangfuseSessionLink();
+  }
+
+  // ---------- Langfuse 可观测性(trace_info → trace chip / header 会话链接) ----------
+  function safeHttpUrl(url) {
+    return typeof url === 'string' && /^https?:\/\//i.test(url) ? url : null;
+  }
+  function langfuseSessionUrl() {
+    const cfg = LANGFUSE_CFG;
+    if (!cfg || !cfg.enabled || !cfg.base_url || !cfg.project_id || !SESSION_ID) return null;
+    return `${cfg.base_url}/project/${encodeURIComponent(cfg.project_id)}/sessions/${encodeURIComponent(SESSION_ID)}`;
+  }
+  function updateLangfuseSessionLink() {
+    const href = safeHttpUrl(langfuseSessionUrl());
+    $langfuseSession.hidden = !href;
+    if (href) $langfuseSession.href = href;
+    else $langfuseSession.removeAttribute('href');
+  }
+  // project_id 在服务端后台解析,/api/health 首屏时可能还是 null;trace_info 自带链接,顺手回填
+  function learnLangfuseProject(traceUrl) {
+    const m = typeof traceUrl === 'string' ? /\/project\/([^/]+)\/traces\//.exec(traceUrl) : null;
+    if (!m || !LANGFUSE_CFG || LANGFUSE_CFG.project_id) return;
+    LANGFUSE_CFG.project_id = decodeURIComponent(m[1]);
+    updateLangfuseSessionLink();
+  }
+  // AI 气泡底部的 trace chip:短 id(悬停看全)+ 复制 + ↗ Langfuse + 续接 / 未采样标记。
+  // 全部用 DOM API + textContent 构造,不拼 innerHTML。
+  function renderTraceMeta(el, info) {
+    if (!info || typeof info.trace_id !== 'string') return;
+    el.textContent = '';
+    const label = document.createElement('span');
+    label.textContent = '🔎 trace';
+    const code = document.createElement('code');
+    code.textContent = info.trace_id.slice(0, 8);
+    code.title = info.trace_id;
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.textContent = '📋';
+    copy.title = '复制完整 trace_id';
+    copy.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(info.trace_id); showToast('已复制 trace_id'); }
+      catch (e) { showToast('复制失败', true); }
+    });
+    el.append(label, code, copy);
+    const url = safeHttpUrl(info.trace_url);
+    if (url) {
+      const a = document.createElement('a');
+      a.href = url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = '↗ Langfuse';
+      a.title = '在 Langfuse 打开此 trace';
+      el.append(a);
+    }
+    if (info.continued) {
+      const badge = document.createElement('span');
+      badge.className = 'trace-badge';
+      badge.textContent = '续接';
+      badge.title = '同一条 trace 的续接段(HITL 恢复 / 计划执行)';
+      el.append(badge);
+    }
+    if (info.sampled === false) {
+      const warn = document.createElement('span');
+      warn.className = 'trace-badge warn';
+      warn.textContent = '未采样';
+      warn.title = 'LANGFUSE_SAMPLE_RATE < 1:本 trace 未被采样,在 Langfuse 中查不到';
+      el.append(warn);
+    }
+    el.hidden = false;
   }
 
   // ---------- session 列表/历史/切换/归档 ----------
@@ -2532,12 +2640,16 @@
     confidencePanel.className = 'confidence-panel';
     confidencePanel.hidden = true;
     $answer.insertAdjacentElement('afterend', confidencePanel);
+    const traceMeta = document.createElement('div');  // Langfuse trace chip,trace_info 到达后显示
+    traceMeta.className = 'trace-meta';
+    traceMeta.hidden = true;
+    confidencePanel.insertAdjacentElement('afterend', traceMeta);
     const thinkTextNode = document.createTextNode('');
     $thinkBody.appendChild(thinkTextNode);
 
     const ctx = {
       aiDiv, $think, $thinkBody, $thinkSummary, $toolStrip, $answer, $searchStatus,
-      confidencePanel,
+      confidencePanel, traceMeta,
       thinkTextNode,
       answerBuf: '', thinkStartTs: 0, answeringFlipped: false, answerStarted: false,
       searchFadeTimer: 0,
@@ -2688,7 +2800,11 @@
       for (const block of blocks) {
         if (!block.trim()) continue;
         const ev = parseSSEBlock(block);
-        if (ev.event === 'thinking') {
+        if (ev.event === 'trace_info') {
+          // Langfuse trace 首帧(仅追踪启用时服务端才发):气泡底部显示 trace chip
+          renderTraceMeta(ctx.traceMeta, ev.data);
+          learnLangfuseProject(ev.data && ev.data.trace_url);
+        } else if (ev.event === 'thinking') {
           if (!ctx.thinkStartTs) {
             ctx.thinkStartTs = Date.now();
             ctx.$think.hidden = false;
@@ -3880,6 +3996,10 @@
       const data = await resp.json();
       if (data && typeof data.api_mode === 'string') {
         API_MODE_CACHE = data.api_mode;
+      }
+      if (data && data.langfuse && typeof data.langfuse === 'object') {
+        LANGFUSE_CFG = data.langfuse;
+        updateLangfuseSessionLink();
       }
     } catch (e) { /* keep default 'chat' */ }
   }

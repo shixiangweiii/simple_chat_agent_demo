@@ -9,6 +9,11 @@
                                     每项形如 {"id":..., "name":..., "arguments": str(JSON 文本)};
                                     仅 llm_stream_chat_with_tools 入口会 yield
     - ("error", message:str)        服务端错误
+    - ("usage", dict)               本次调用的 token 用量(model_dump 原样,Chat 为 prompt/completion_tokens,
+                                    Responses 为 input/output_tokens);三个异步 impl 都发,由 chat_core 的
+                                    可观测性包装(_traced_llm_stream)消费并吞掉 —— 直接消费本模块流的
+                                    调用方必须忽略未知 kind,不能按"非 thinking 即正文"处理
+同步入口(llm / llm_chat_with_tools / complete / embed_texts)不改返回值,改用可选 on_usage(dict) 回调交出 usage。
 
 env:
     DASHSCOPE_API_KEY  必须;首次调用 LLM 时校验,缺失直接抛 RuntimeError
@@ -20,7 +25,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Callable
 
 import httpx  # openai 的传递依赖,已在 .venv;rerank 走裸 HTTP(非 OpenAI SDK 方法)
 from openai import OpenAI
@@ -105,6 +110,27 @@ def _get_client() -> OpenAI:
     return _client
 
 
+UsageCallback = Callable[[dict], None]
+
+
+def _usage_payload(usage) -> dict | None:
+    """SDK usage 对象 → 纯 dict(日志 / ("usage", dict) 事件 / on_usage 回调共用)。"""
+    if usage is None:
+        return None
+    payload = usage.model_dump() if hasattr(usage, "model_dump") else usage
+    return payload if isinstance(payload, dict) else None
+
+
+def _emit_usage(on_usage: UsageCallback | None, payload: dict | None) -> None:
+    """调用方的 on_usage 回调只用于可观测性,异常绝不外泄到 LLM 调用路径。"""
+    if on_usage is None or payload is None:
+        return
+    try:
+        on_usage(payload)
+    except Exception:
+        logger.debug("on_usage 回调失败", exc_info=True)
+
+
 def _extract_output_text(response_obj) -> str:
     """从一个完整 response 对象里抠出所有 message 类型 output 的文本拼接。
 
@@ -132,18 +158,19 @@ def _extract_output_text(response_obj) -> str:
 # 同步流式 (CLI) - llm()
 # ============================================================
 
-def llm(prompt: str) -> str:
+def llm(prompt: str, *, on_usage: UsageCallback | None = None) -> str:
     """同步流式调用 LLM,CLI 模式专用。根据 API_MODE 路由到 Chat Completions 或 Responses API。
 
     返回最终回复文本字符串。无论底层走哪个 API,签名稳定,中间事件(思考、搜索 lifecycle 等)全部丢弃。
+    on_usage: 可选,拿到 token 用量时回调一次(可观测性用)。
     """
     client = _get_client()
     if API_MODE == "chat":
-        return _llm_chat(prompt, client)
-    return _llm_responses(prompt, client)
+        return _llm_chat(prompt, client, on_usage=on_usage)
+    return _llm_responses(prompt, client, on_usage=on_usage)
 
 
-def _llm_responses(prompt: str, client: OpenAI) -> str:
+def _llm_responses(prompt: str, client: OpenAI, *, on_usage: UsageCallback | None = None) -> str:
     """[Responses API 实现] 流式调用 client.responses.create。
 
     - 监听 `response.output_text.delta` 累积文本
@@ -228,10 +255,9 @@ def _llm_responses(prompt: str, client: OpenAI) -> str:
             logger.info("response.completed status=%s", status)
             usage = getattr(chunk_response, "usage", None) if chunk_response else None
             if usage is not None:
-                usage_payload = (
-                    usage.model_dump() if hasattr(usage, "model_dump") else usage
-                )
+                usage_payload = _usage_payload(usage)
                 logger.info("usage=%s", usage_payload)
+                _emit_usage(on_usage, usage_payload)
         # 其他事件（output_item.*、content_part.*、created、in_progress、reasoning_summary_text.done 等）忽略
 
     elapsed_ms = (time.monotonic() - started_at) * 1000
@@ -256,7 +282,7 @@ def _llm_responses(prompt: str, client: OpenAI) -> str:
     return result
 
 
-def _llm_chat(prompt: str, client: OpenAI) -> str:
+def _llm_chat(prompt: str, client: OpenAI, *, on_usage: UsageCallback | None = None) -> str:
     """[Chat Completions API 实现 / 保留作教学对照] 运行时业务路径已不再走本函数 ——
     chat 模式现走 _llm_chat_with_tools(native function calling + MCP)。本函数仍保留
     展示 enable_search 后台搜索方案与 native function calling 的对照。
@@ -326,10 +352,9 @@ def _llm_chat(prompt: str, client: OpenAI) -> str:
             # 流尾 usage 帧
             usage = getattr(chunk, "usage", None)
             if usage is not None:
-                usage_payload = (
-                    usage.model_dump() if hasattr(usage, "model_dump") else usage
-                )
+                usage_payload = _usage_payload(usage)
                 logger.info("usage=%s", usage_payload)
+                _emit_usage(on_usage, usage_payload)
             continue
 
         delta = getattr(choices[0], "delta", None)
@@ -367,6 +392,7 @@ async def llm_stream(prompt: str) -> AsyncGenerator[tuple[str, str], None]:
         - ("content", text)         最终回复增量
         - ("search_status", phase)  联网搜索阶段(仅 responses 模式;chat 模式不发该事件,前端 banner 自然不出现)
         - ("error", message)        服务端错误
+        - ("usage", dict)           token 用量(payload 是 dict 不是 str,消费方须显式识别或忽略)
     """
     if API_MODE == "chat":
         async for item in _llm_stream_chat(prompt):
@@ -510,10 +536,10 @@ async def _llm_stream_responses(prompt: str) -> AsyncGenerator[tuple[str, str], 
             logger.info("response.completed status=%s", status)
             usage = getattr(chunk_response, "usage", None) if chunk_response else None
             if usage is not None:
-                usage_payload = (
-                    usage.model_dump() if hasattr(usage, "model_dump") else usage
-                )
+                usage_payload = _usage_payload(usage)
                 logger.info("usage=%s", usage_payload)
+                if usage_payload is not None:
+                    yield ("usage", usage_payload)
         # 其他事件（output_item.*、content_part.*、created、in_progress、reasoning_summary_text.done 等）忽略
 
 
@@ -609,10 +635,10 @@ async def _llm_stream_chat(prompt: str) -> AsyncGenerator[tuple[str, str], None]
             # 流尾 usage 帧
             usage = getattr(chunk, "usage", None)
             if usage is not None:
-                usage_payload = (
-                    usage.model_dump() if hasattr(usage, "model_dump") else usage
-                )
+                usage_payload = _usage_payload(usage)
                 logger.info("usage=%s", usage_payload)
+                if usage_payload is not None:
+                    yield ("usage", usage_payload)
             continue
 
         delta = getattr(choices[0], "delta", None)
@@ -638,7 +664,7 @@ async def _llm_stream_chat(prompt: str) -> AsyncGenerator[tuple[str, str], None]
 # ============================================================
 
 def llm_chat_with_tools(
-    messages: list[dict], tools: list[dict]
+    messages: list[dict], tools: list[dict], *, on_usage: UsageCallback | None = None
 ) -> tuple[str, list[dict], str]:
     """同步流式调用 Chat Completions + tools,CLI ReAct 循环用。
 
@@ -646,10 +672,11 @@ def llm_chat_with_tools(
         - tool_calls_list 为 [] 表示模型不再请求工具调用,可作为 ReAct 循环退出条件
         - 每个 tool_call 形如 {"id":..., "name":..., "arguments": str(JSON 文本)}
         - reasoning_content 是 thinking 模式累计的全部思考内容,上层应在
-          下一轮 assistant 消息上原样回传(参考 docs/OpenAI兼容-Chat接口-Function Calling.md:142
+          下一轮 assistant 消息上原样回传(参考 docs/外部接口文档/OpenAI兼容-Chat接口-Function Calling.md:142
           关于 kimi-k2 thinking + tool_calls 的硬性要求,qwen 系列也建议保留)
+    on_usage: 可选,拿到 token 用量时回调一次(可观测性用)。
     """
-    return _llm_chat_with_tools(messages, tools, _get_client())
+    return _llm_chat_with_tools(messages, tools, _get_client(), on_usage=on_usage)
 
 
 async def llm_stream_chat_with_tools(
@@ -663,6 +690,7 @@ async def llm_stream_chat_with_tools(
         - ("content", text:str)         delta.content 增量
         - ("tool_calls", list[dict])    流尾汇总的工具调用列表(每项 {"id","name","arguments"})
         - ("error", message:str)        服务端 / 嵌入式错误
+        - ("usage", dict)               token 用量(流尾 usage 帧,早于 tool_calls)
     """
     async for item in _llm_stream_chat_with_tools(messages, tools):
         yield item
@@ -710,6 +738,8 @@ def _llm_chat_with_tools(
     messages: list[dict],
     tools: list[dict],
     client: OpenAI,
+    *,
+    on_usage: UsageCallback | None = None,
 ) -> tuple[str, list[dict], str]:
     """[Chat Completions + tools 同步实现] 流式拼装 content / tool_calls / reasoning_content,流结束后一次性返回。
 
@@ -781,10 +811,9 @@ def _llm_chat_with_tools(
         if not choices:
             usage = getattr(chunk, "usage", None)
             if usage is not None:
-                usage_payload = (
-                    usage.model_dump() if hasattr(usage, "model_dump") else usage
-                )
+                usage_payload = _usage_payload(usage)
                 logger.info("usage=%s", usage_payload)
+                _emit_usage(on_usage, usage_payload)
             continue
 
         delta = getattr(choices[0], "delta", None)
@@ -828,6 +857,7 @@ async def _llm_stream_chat_with_tools(
         - ("content", text:str)
         - ("tool_calls", list[dict])  流尾一次性发出,每项 {"id","name","arguments"(JSON 文本)}
         - ("error", message:str)
+        - ("usage", dict)
 
     设计取舍:tool_calls 不逐 chunk yield —— 单 chunk 不携带完整 arguments,语义不完整。
     上层 ReAct 循环本就需要拿到完整 tool_calls 才能 json.loads 后执行,故汇总后一次性 yield。
@@ -920,10 +950,10 @@ async def _llm_stream_chat_with_tools(
         if not choices:
             usage = getattr(chunk, "usage", None)
             if usage is not None:
-                usage_payload = (
-                    usage.model_dump() if hasattr(usage, "model_dump") else usage
-                )
+                usage_payload = _usage_payload(usage)
                 logger.info("usage=%s", usage_payload)
+                if usage_payload is not None:
+                    yield ("usage", usage_payload)
             continue
 
         delta = getattr(choices[0], "delta", None)
@@ -953,11 +983,11 @@ async def _llm_stream_chat_with_tools(
 #   - **不带 tools / 不带 enable_search**,避免抽取时模型误触发联网搜索;
 #   - 始终走 chat.completions,与 API_MODE 解耦 (responses 模式的部署也能用)。
 
-def complete(prompt: str, *, temperature: float = 0.0) -> str:
+def complete(prompt: str, *, temperature: float = 0.0, on_usage: UsageCallback | None = None) -> str:
     """同步无工具补全(长期记忆抽取/协调专用)。返回最终文本。失败抛异常,由上层兜底。
 
     用 LTM_MODEL(默认 = 主 MODEL,可单独配更便宜的模型)+ LTM_COMPLETE_TIMEOUT 硬超时
-    (把持锁的最坏时长压到秒级)。
+    (把持锁的最坏时长压到秒级)。on_usage: 可选,回调一次 token 用量(可观测性用)。
     """
     client = _get_client()
     started_at = time.monotonic()
@@ -973,6 +1003,7 @@ def complete(prompt: str, *, temperature: float = 0.0) -> str:
     if choices:
         message = getattr(choices[0], "message", None)
         content = (getattr(message, "content", None) or "") if message is not None else ""
+    _emit_usage(on_usage, _usage_payload(getattr(resp, "usage", None)))
     logger.info(
         "complete 结束:elapsed=%.0fms model=%s prompt_chars=%d content_chars=%d",
         (time.monotonic() - started_at) * 1000, LTM_MODEL, len(prompt), len(content),
@@ -980,26 +1011,32 @@ def complete(prompt: str, *, temperature: float = 0.0) -> str:
     return content
 
 
-async def complete_async(prompt: str, *, temperature: float = 0.0) -> str:
+async def complete_async(
+    prompt: str, *, temperature: float = 0.0, on_usage: UsageCallback | None = None,
+) -> str:
     """异步无工具补全 —— 把阻塞的 complete() 丢到线程池,避免阻塞事件循环。"""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: complete(prompt, temperature=temperature))
+    return await loop.run_in_executor(
+        None, lambda: complete(prompt, temperature=temperature, on_usage=on_usage),
+    )
 
 
 # ============================================================
 # Phase 11 长期记忆 —— 向量 embedding + rerank 精排 (检索层)
 # ============================================================
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def embed_texts(texts: list[str], *, on_usage: UsageCallback | None = None) -> list[list[float]]:
     """同步批量 embedding。返回与 texts 等长、同序的向量列表。
 
     OpenAI 兼容路径 (与 chat 共用 client 单例)。单次最多 EMBED_BATCH_MAX 条,超出分批。
     失败抛异常,由上层 (longterm_memory) 兜底为"不写向量,走降级"。
+    on_usage: 可选,所有批次结束后回调一次累加的 token 用量(可观测性用)。
     """
     if not texts:
         return []
     client = _get_client()
     out: list[list[float]] = []
+    usage_total: dict[str, int] = {}
     for i in range(0, len(texts), EMBED_BATCH_MAX):
         batch = texts[i:i + EMBED_BATCH_MAX]
         resp = client.embeddings.create(
@@ -1009,13 +1046,19 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         # data[].index 是 batch 内序号,排序后还原输入顺序
         items = sorted(resp.data, key=lambda d: getattr(d, "index", 0))
         out.extend(list(d.embedding) for d in items)
+        for k, v in (_usage_payload(getattr(resp, "usage", None)) or {}).items():
+            if isinstance(v, int):
+                usage_total[k] = usage_total.get(k, 0) + v
+    _emit_usage(on_usage, usage_total or None)
     return out
 
 
-async def embed_texts_async(texts: list[str]) -> list[list[float]]:
+async def embed_texts_async(
+    texts: list[str], *, on_usage: UsageCallback | None = None,
+) -> list[list[float]]:
     """异步批量 embedding —— 阻塞调用丢线程池。"""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: embed_texts(texts))
+    return await loop.run_in_executor(None, lambda: embed_texts(texts, on_usage=on_usage))
 
 
 def _parse_rerank_response(data: dict, n_docs: int) -> list[tuple[int, float]] | None:
